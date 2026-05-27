@@ -77,6 +77,7 @@ class RLM:
         sampling_args: dict[str, Any] | None = None,
         sub_sampling_args: dict[str, Any] | None = None,
         orchestrator: bool = True,
+        user_prologue: str | None = None,
     ):
         """
         Args:
@@ -172,6 +173,11 @@ class RLM:
         self.max_errors = max_errors
         self.system_prompt = custom_system_prompt if custom_system_prompt else RLM_SYSTEM_PROMPT
         self.orchestrator = orchestrator
+        # Optional user-prologue message inserted between the metadata user
+        # message and the iter-0 turn prompt. Mirrors RLMTrainEnv's
+        # ``user_prologue`` so canonical inference can match envs that
+        # depend on a task-specific tips message (e.g. BC+).
+        self.user_prologue = user_prologue
         self.logger = logger
         self.verbose = VerbosePrinter(enabled=verbose)
 
@@ -306,6 +312,8 @@ class RLM:
             root_prompt=root_prompt,
             orchestrator=self.orchestrator,
         )
+        if self.user_prologue:
+            message_history.append({"role": "user", "content": self.user_prologue})
         if self.compaction:
             message_history[0]["content"] += (
                 "\n\nThe full conversation history (trajectory segments and any summaries) "
