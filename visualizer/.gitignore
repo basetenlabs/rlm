@@ -42,3 +42,8 @@ next-env.d.ts
 
 # Live trajectory mirror (scripts/watch_rlm_live.sh)
 public/logs/
+
+# The repo-root .gitignore has a broad `logs/` rule that also catches the
+# /api/logs route source — re-include it (it's code, not log output).
+!src/app/api/logs/
+!src/app/api/logs/route.ts

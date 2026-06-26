@@ -6,6 +6,10 @@ export interface RLMChatCompletion {
   prompt_tokens: number;
   completion_tokens: number;
   execution_time: number;
+  // Present in real harness logs; normalized into the token fields above by parse-logs.
+  root_model?: string;
+  usage_summary?: Record<string, unknown>;
+  error?: string | null;
 }
 
 export interface REPLResult {
@@ -42,6 +46,16 @@ export interface RLMConfigMetadata {
   environment_type: string | null;
   environment_kwargs: Record<string, unknown> | null;
   other_backends: string[] | null;
+  // Wall-clock seconds spent parsing the data room before the RLM loop (future runs only).
+  parse_seconds: number | null;
+}
+
+// Per-iteration timing decomposition, derived from data already in the log.
+export interface IterationTiming {
+  total: number;     // iteration_time (LM generation + all code execution)
+  lmGen: number;     // root-model response generation
+  codePure: number;  // Python REPL execution, excluding sub-LM calls made during exec
+  subCall: number;   // sum of sub-LM (rlm_query) call latencies
 }
 
 export interface RLMLogFile {

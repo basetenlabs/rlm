@@ -5,7 +5,9 @@ import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { CodeBlock } from './CodeBlock';
+import { TimingBreakdown } from './TimingBreakdown';
 import { RLMIteration } from '@/lib/types';
+import { getIterationTiming } from '@/lib/parse-logs';
 
 interface ExecutionPanelProps {
   iteration: RLMIteration | null;
@@ -28,9 +30,11 @@ export function ExecutionPanel({ iteration }: ExecutionPanelProps) {
   }
 
   const totalSubCalls = iteration.code_blocks.reduce(
-    (acc, block) => acc + (block.result?.rlm_calls?.length || 0), 
+    (acc, block) => acc + (block.result?.rlm_calls?.length || 0),
     0
   );
+
+  const timing = getIterationTiming(iteration);
 
   return (
     <div className="h-full flex flex-col overflow-hidden bg-background">
@@ -66,6 +70,13 @@ export function ExecutionPanel({ iteration }: ExecutionPanelProps) {
             </Badge>
           )}
         </div>
+
+        {/* Per-iteration timing breakdown */}
+        {timing.total > 0 && (
+          <div className="mt-3">
+            <TimingBreakdown timing={timing} />
+          </div>
+        )}
       </div>
 
       {/* Tabs - Code Execution and Sub-LM Calls only */}
@@ -122,7 +133,7 @@ export function ExecutionPanel({ iteration }: ExecutionPanelProps) {
                           <div className="flex items-center justify-between flex-wrap gap-2">
                             <CardTitle className="text-sm flex items-center gap-2">
                               <span className="w-2 h-2 rounded-full bg-fuchsia-500 dark:bg-fuchsia-400" />
-                              llm_query() from Block #{blockIdx + 1}
+                              rlm_query() from Block #{blockIdx + 1}
                             </CardTitle>
                             <div className="flex gap-2">
                               <Badge variant="outline" className="text-[10px] font-mono">

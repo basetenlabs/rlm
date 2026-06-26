@@ -9,23 +9,42 @@ interface FileUploaderProps {
   onFileLoaded: (fileName: string, content: string) => void;
 }
 
+// The uploader reads the whole file into memory via file.text(); past this size the
+// browser tab risks freezing. Warn (don't silently crash) and point at the trimmer.
+const MAX_SAFE_BYTES = 150 * 1024 * 1024;
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
 export function FileUploader({ onFileLoaded }: FileUploaderProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleFile = useCallback(async (file: File) => {
+    setError(null);
     if (!file.name.endsWith('.jsonl')) {
-      alert('Please upload a .jsonl file');
+      setError('Please upload a .jsonl file');
       return;
+    }
+    if (file.size > MAX_SAFE_BYTES) {
+      const ok = window.confirm(
+        `${file.name} is ${formatBytes(file.size)} — loading it may freeze the browser.\n` +
+        `Consider trimming it first (scripts/trim_rlm_log.py). Load anyway?`
+      );
+      if (!ok) return;
     }
 
     setIsLoading(true);
     try {
       const content = await file.text();
       onFileLoaded(file.name, content);
-    } catch (error) {
-      console.error('Error reading file:', error);
-      alert('Failed to read file');
+    } catch (err) {
+      console.error('Error reading file:', err);
+      setError('Failed to read file');
     } finally {
       setIsLoading(false);
     }
@@ -108,6 +127,10 @@ export function FileUploader({ onFileLoaded }: FileUploaderProps) {
             {isLoading ? 'Loading...' : 'Choose File'}
           </label>
         </Button>
+
+        {error && (
+          <p className="mt-3 text-xs text-red-600 dark:text-red-400">{error}</p>
+        )}
       </CardContent>
     </Card>
   );

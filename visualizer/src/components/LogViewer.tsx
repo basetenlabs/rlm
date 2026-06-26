@@ -9,6 +9,7 @@ import { StatsCard } from './StatsCard';
 import { TrajectoryPanel } from './TrajectoryPanel';
 import { ExecutionPanel } from './ExecutionPanel';
 import { IterationTimeline } from './IterationTimeline';
+import { RunTimeline } from './RunTimeline';
 import { ThemeToggle } from './ThemeToggle';
 import { RLMLogFile } from '@/lib/types';
 
@@ -28,6 +29,9 @@ export function LogViewer({ logFile, onBack, live = false }: LogViewerProps) {
   // to inspect an earlier turn, leave them there.
   useEffect(() => {
     if (live && selectedIteration >= prevLenRef.current - 1) {
+      // Syncing selection to a streaming external log (new iterations arriving) — the
+      // documented exemption for set-state-in-effect.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedIteration(Math.max(0, iterations.length - 1));
     }
     prevLenRef.current = iterations.length;
@@ -156,8 +160,19 @@ export function LogViewer({ logFile, onBack, live = false }: LogViewerProps) {
               value={`${metadata.totalExecutionTime.toFixed(2)}s`}
               icon="⏱"
               variant="yellow"
+              subtext={config.parse_seconds != null ? `parse ${config.parse_seconds.toFixed(1)}s` : undefined}
             />
           </div>
+        </div>
+
+        {/* Run-wide timing waterfall */}
+        <div className="mt-4">
+          <RunTimeline
+            iterations={iterations}
+            selectedIteration={selectedIteration}
+            onSelectIteration={setSelectedIteration}
+            parseSeconds={config.parse_seconds}
+          />
         </div>
       </div>
 

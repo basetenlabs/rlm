@@ -9,15 +9,25 @@ import { LogViewer } from './LogViewer';
 import { AsciiRLM } from './AsciiGlobe';
 import { ThemeToggle } from './ThemeToggle';
 import { Button } from '@/components/ui/button';
-import { parseLogFile, extractContextVariable } from '@/lib/parse-logs';
+import { parseLogFile } from '@/lib/parse-logs';
 import { RLMLogFile } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
+// Files larger than this are too big to safely read into the browser in one shot;
+// nudge the user toward trimming instead of crashing the tab.
+const MAX_SAFE_BYTES = 150 * 1024 * 1024;
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${bytes} B`;
+}
+
 interface DemoLogInfo {
   fileName: string;
-  contextPreview: string | null;
-  hasFinalAnswer: boolean;
-  iterations: number;
+  size: number;
+  mtime: number;
 }
 
 export function Dashboard() {
@@ -30,46 +40,28 @@ export function Dashboard() {
   const [liveMode, setLiveMode] = useState(false);
   const LIVE_FILE = 'live.jsonl';
 
-  // Load demo log previews on mount - fetches latest 10 from API
+  // Load the recent-traces list on mount. The API returns only name/size/mtime,
+  // so we never pull whole (potentially multi-GB) log files into memory here.
   useEffect(() => {
     async function loadDemoPreviews() {
       try {
-        // Fetch list of log files from API
         const listResponse = await fetch('/api/logs');
-        if (!listResponse.ok) {
-          throw new Error('Failed to fetch log list');
-        }
+        if (!listResponse.ok) throw new Error('Failed to fetch log list');
         const { files } = await listResponse.json();
-        
-        const previews: DemoLogInfo[] = [];
-        
-        for (const fileName of files) {
-          try {
-            const response = await fetch(`/logs/${fileName}`);
-            if (!response.ok) continue;
-            const content = await response.text();
-            const parsed = parseLogFile(fileName, content);
-            const contextVar = extractContextVariable(parsed.iterations);
-            
-            previews.push({
-              fileName,
-              contextPreview: contextVar,
-              hasFinalAnswer: !!parsed.metadata.finalAnswer,
-              iterations: parsed.metadata.totalIterations,
-            });
-          } catch (e) {
-            console.error('Failed to load demo preview:', fileName, e);
-          }
-        }
-        
-        setDemoLogs(previews);
+        setDemoLogs(
+          (files as Array<{ name: string; size: number; mtime: number }>).map((f) => ({
+            fileName: f.name,
+            size: f.size,
+            mtime: f.mtime,
+          }))
+        );
       } catch (e) {
-        console.error('Failed to load demo logs:', e);
+        console.error('Failed to load recent traces:', e);
       } finally {
         setLoadingDemos(false);
       }
     }
-    
+
     loadDemoPreviews();
   }, []);
 
@@ -113,7 +105,14 @@ export function Dashboard() {
     setSelectedLog(parsed);
   }, []);
 
-  const loadDemoLog = useCallback(async (fileName: string) => {
+  const loadDemoLog = useCallback(async (fileName: string, size?: number) => {
+    if (size != null && size > MAX_SAFE_BYTES) {
+      const ok = window.confirm(
+        `${fileName} is ${formatBytes(size)} — loading it may freeze the browser.\n` +
+        `Consider trimming it first (scripts/trim_rlm_log.py). Load anyway?`
+      );
+      if (!ok) return;
+    }
     try {
       const response = await fetch(`/logs/${fileName}`);
       if (!response.ok) throw new Error('Failed to load demo log');
@@ -240,7 +239,7 @@ export function Dashboard() {
                       {demoLogs.map((demo) => (
                         <Card
                           key={demo.fileName}
-                          onClick={() => loadDemoLog(demo.fileName)}
+                          onClick={() => loadDemoLog(demo.fileName, demo.size)}
                           className={cn(
                             'cursor-pointer transition-all hover:scale-[1.01]',
                             'hover:border-primary/50 hover:bg-primary/5'
@@ -248,36 +247,22 @@ export function Dashboard() {
                         >
                           <CardContent className="p-3">
                             <div className="flex items-center gap-3">
-                              {/* Status indicator */}
-                              <div className="relative flex-shrink-0">
-                                <div className={cn(
-                                  'w-2.5 h-2.5 rounded-full',
-                                  demo.hasFinalAnswer 
-                                    ? 'bg-primary' 
-                                    : 'bg-muted-foreground/30'
-                                )} />
-                                {demo.hasFinalAnswer && (
-                                  <div className="absolute inset-0 w-2.5 h-2.5 rounded-full bg-primary animate-ping opacity-50" />
-                                )}
-                              </div>
-                              
-                              {/* Content */}
+                              <div className="w-2.5 h-2.5 rounded-full bg-muted-foreground/30 flex-shrink-0" />
                               <div className="flex-1 min-w-0">
-                                <div className="flex items-center gap-2 mb-1">
-                                  <span className="font-mono text-xs text-foreground/80">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono text-xs text-foreground/80 truncate">
                                     {demo.fileName}
                                   </span>
-                                  <Badge variant="outline" className="text-[9px] px-1.5 py-0 h-4">
-                                    {demo.iterations} iter
+                                  <Badge
+                                    variant="outline"
+                                    className={cn(
+                                      'text-[9px] px-1.5 py-0 h-4 ml-auto flex-shrink-0',
+                                      demo.size > MAX_SAFE_BYTES && 'border-amber-500/50 text-amber-600 dark:text-amber-400'
+                                    )}
+                                  >
+                                    {formatBytes(demo.size)}
                                   </Badge>
                                 </div>
-                                {demo.contextPreview && (
-                                  <p className="text-[11px] font-mono text-muted-foreground truncate">
-                                    {demo.contextPreview.length > 80 
-                                      ? demo.contextPreview.slice(0, 80) + '...'
-                                      : demo.contextPreview}
-                                  </p>
-                                )}
                               </div>
                             </div>
                           </CardContent>

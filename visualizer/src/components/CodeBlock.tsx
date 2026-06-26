@@ -87,7 +87,7 @@ export function CodeBlock({ block, index }: CodeBlockProps) {
                     stdout
                   </span>
                 </div>
-                <pre className="code-block p-4 overflow-x-auto">
+                <pre className="code-block p-4 overflow-x-auto max-w-full min-w-0">
                   <code className="text-emerald-700 dark:text-emerald-300">
                     {block.result.stdout}
                   </code>
@@ -103,7 +103,7 @@ export function CodeBlock({ block, index }: CodeBlockProps) {
                     stderr
                   </span>
                 </div>
-                <pre className="code-block p-4 overflow-x-auto">
+                <pre className="code-block p-4 overflow-x-auto max-w-full min-w-0">
                   <code className="text-red-700 dark:text-red-300">
                     {block.result.stderr}
                   </code>
@@ -154,12 +154,14 @@ export function CodeBlock({ block, index }: CodeBlockProps) {
                     >
                       <div className="flex items-center justify-between mb-2">
                         <Badge className="bg-fuchsia-500 text-white dark:bg-fuchsia-400 dark:text-fuchsia-950 text-xs">
-                          llm_query #{i + 1}
+                          rlm_query #{i + 1}
                         </Badge>
-                        <div className="flex gap-2 text-xs text-muted-foreground">
-                          <span>{call.prompt_tokens} prompt</span>
+                        <div className="flex gap-2 text-xs text-muted-foreground font-mono">
+                          <span>{call.prompt_tokens} in</span>
                           <span>•</span>
-                          <span>{call.completion_tokens} completion</span>
+                          <span>{call.completion_tokens} out</span>
+                          <span>•</span>
+                          <span className="text-fuchsia-600 dark:text-fuchsia-400">{call.execution_time.toFixed(2)}s</span>
                         </div>
                       </div>
                       <div className="text-xs text-muted-foreground mb-1">Prompt:</div>

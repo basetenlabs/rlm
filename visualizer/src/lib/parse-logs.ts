@@ -1,4 +1,57 @@
-import { RLMIteration, RLMLogFile, LogMetadata, RLMConfigMetadata, extractFinalAnswer } from './types';
+import { RLMIteration, RLMLogFile, LogMetadata, RLMConfigMetadata, IterationTiming, extractFinalAnswer } from './types';
+
+// Real harness logs record sub-call token usage under `usage_summary`, shaped like
+//   { model_usage_summaries: { "<model>": { total_input_tokens, total_output_tokens } } }
+// rather than flat prompt_tokens/completion_tokens. Normalize (summing across models,
+// since one sub-call may fan out to several) so the UI can rely on the flat fields.
+function sumUsage(usage: Record<string, unknown> | undefined, kind: 'input' | 'output'): number {
+  if (!usage) return 0;
+  const totalKey = kind === 'input' ? 'total_input_tokens' : 'total_output_tokens';
+  const mus = usage['model_usage_summaries'];
+  if (mus && typeof mus === 'object') {
+    let sum = 0;
+    for (const m of Object.values(mus as Record<string, unknown>)) {
+      const v = (m as Record<string, unknown>)?.[totalKey];
+      if (typeof v === 'number') sum += v;
+    }
+    return sum;
+  }
+  // Fallbacks: flat OpenAI shape, or a top-level total.
+  const flatKey = kind === 'input' ? 'prompt_tokens' : 'completion_tokens';
+  const flat = usage[flatKey] ?? usage[totalKey];
+  return typeof flat === 'number' ? flat : 0;
+}
+
+function normalizeIteration(iter: RLMIteration): RLMIteration {
+  for (const block of iter.code_blocks ?? []) {
+    for (const call of block.result?.rlm_calls ?? []) {
+      if (typeof call.prompt_tokens !== 'number') {
+        call.prompt_tokens = sumUsage(call.usage_summary, 'input');
+      }
+      if (typeof call.completion_tokens !== 'number') {
+        call.completion_tokens = sumUsage(call.usage_summary, 'output');
+      }
+    }
+  }
+  return iter;
+}
+
+// Decompose an iteration's wall-clock into LM-generation / pure-code / sub-call time.
+// All values come from data already in the log (see IterationTiming).
+export function getIterationTiming(iter: RLMIteration): IterationTiming {
+  let codeTotal = 0;
+  let subCall = 0;
+  for (const block of iter.code_blocks ?? []) {
+    codeTotal += block.result?.execution_time ?? 0;
+    for (const call of block.result?.rlm_calls ?? []) {
+      subCall += call.execution_time ?? 0;
+    }
+  }
+  const total = iter.iteration_time ?? codeTotal;
+  const lmGen = Math.max(0, total - codeTotal);
+  const codePure = Math.max(0, codeTotal - subCall);
+  return { total, lmGen, codePure, subCall };
+}
 
 // Extract the context variable from code block locals
 export function extractContextVariable(iterations: RLMIteration[]): string | null {
@@ -26,6 +79,7 @@ function getDefaultConfig(): RLMConfigMetadata {
     environment_type: null,
     environment_kwargs: null,
     other_backends: null,
+    parse_seconds: null,
   };
 }
 
@@ -54,10 +108,11 @@ export function parseJSONL(content: string): ParsedJSONL {
           environment_type: parsed.environment_type ?? null,
           environment_kwargs: parsed.environment_kwargs ?? null,
           other_backends: parsed.other_backends ?? null,
+          parse_seconds: parsed.parse_seconds ?? null,
         };
       } else {
         // This is an iteration entry
-        iterations.push(parsed as RLMIteration);
+        iterations.push(normalizeIteration(parsed as RLMIteration));
       }
     } catch (e) {
       console.error('Failed to parse line:', line, e);

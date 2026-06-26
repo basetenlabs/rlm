@@ -157,9 +157,10 @@ export function IterationTimeline({
                       {responseSnippet}{iteration.response.length > 60 ? '...' : ''}
                     </p>
                     
-                    {/* Bottom row: tokens */}
+                    {/* Bottom row: tokens (root-model counts aren't logged → char-based estimate) */}
                     <div className="flex items-center gap-2 mt-1 text-[9px] font-mono text-muted-foreground/70">
-                      <span>
+                      <span title="Estimated from character count — root-model token usage is not recorded in the log">
+                        <span className="text-muted-foreground/50">~</span>
                         <span className="text-sky-600 dark:text-sky-400">{(stats.inputTokens / 1000).toFixed(1)}k</span>
                         <span className="mx-0.5">→</span>
                         <span className="text-emerald-600 dark:text-emerald-400">{(stats.outputTokens / 1000).toFixed(1)}k</span>
