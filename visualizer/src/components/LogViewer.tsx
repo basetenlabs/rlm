@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -15,11 +15,23 @@ import { RLMLogFile } from '@/lib/types';
 interface LogViewerProps {
   logFile: RLMLogFile;
   onBack: () => void;
+  live?: boolean;
 }
 
-export function LogViewer({ logFile, onBack }: LogViewerProps) {
+export function LogViewer({ logFile, onBack, live = false }: LogViewerProps) {
   const [selectedIteration, setSelectedIteration] = useState(0);
   const { iterations, metadata, config } = logFile;
+  const prevLenRef = useRef(iterations.length);
+
+  // Tail-follow: in live mode, if the user is already at the latest iteration,
+  // advance to the new latest as iterations stream in. If they've scrolled back
+  // to inspect an earlier turn, leave them there.
+  useEffect(() => {
+    if (live && selectedIteration >= prevLenRef.current - 1) {
+      setSelectedIteration(Math.max(0, iterations.length - 1));
+    }
+    prevLenRef.current = iterations.length;
+  }, [iterations.length, live, selectedIteration]);
 
   const goToPrevious = useCallback(() => {
     setSelectedIteration(prev => Math.max(0, prev - 1));
@@ -72,6 +84,12 @@ export function LogViewer({ logFile, onBack }: LogViewerProps) {
               </div>
             </div>
             <div className="flex items-center gap-3">
+              {live && (
+                <Badge variant="outline" className="border-red-500/50 text-red-500 text-xs gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                  LIVE • {iterations.length} iter
+                </Badge>
+              )}
               {metadata.hasErrors && (
                 <Badge variant="destructive" className="text-xs">Has Errors</Badge>
               )}

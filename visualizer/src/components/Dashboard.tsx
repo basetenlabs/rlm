@@ -8,6 +8,7 @@ import { FileUploader } from './FileUploader';
 import { LogViewer } from './LogViewer';
 import { AsciiRLM } from './AsciiGlobe';
 import { ThemeToggle } from './ThemeToggle';
+import { Button } from '@/components/ui/button';
 import { parseLogFile, extractContextVariable } from '@/lib/parse-logs';
 import { RLMLogFile } from '@/lib/types';
 import { cn } from '@/lib/utils';
@@ -24,6 +25,10 @@ export function Dashboard() {
   const [selectedLog, setSelectedLog] = useState<RLMLogFile | null>(null);
   const [demoLogs, setDemoLogs] = useState<DemoLogInfo[]>([]);
   const [loadingDemos, setLoadingDemos] = useState(true);
+  // Live mode: poll a continuously-mirrored trajectory and re-render as it grows.
+  // Feed it with `scripts/watch_rlm_live.sh <run-id>` (writes public/logs/live.jsonl).
+  const [liveMode, setLiveMode] = useState(false);
+  const LIVE_FILE = 'live.jsonl';
 
   // Load demo log previews on mount - fetches latest 10 from API
   useEffect(() => {
@@ -68,6 +73,35 @@ export function Dashboard() {
     loadDemoPreviews();
   }, []);
 
+  // Live polling: re-fetch the mirrored trajectory and update the open log.
+  useEffect(() => {
+    if (!liveMode) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch(`/logs/${LIVE_FILE}?t=${Date.now()}`, { cache: 'no-store' });
+        if (!res.ok || cancelled) return;
+        const content = await res.text();
+        if (cancelled || !content.trim()) return;
+        const parsed = parseLogFile(LIVE_FILE, content);
+        setSelectedLog(parsed);
+        setLogFiles(prev =>
+          prev.some(f => f.fileName === LIVE_FILE)
+            ? prev.map(f => (f.fileName === LIVE_FILE ? parsed : f))
+            : [...prev, parsed]
+        );
+      } catch {
+        /* transient fetch/parse error mid-write — ignore, next tick retries */
+      }
+    };
+    poll();
+    const id = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [liveMode]);
+
   const handleFileLoaded = useCallback((fileName: string, content: string) => {
     const parsed = parseLogFile(fileName, content);
     setLogFiles(prev => {
@@ -93,9 +127,10 @@ export function Dashboard() {
 
   if (selectedLog) {
     return (
-      <LogViewer 
-        logFile={selectedLog} 
-        onBack={() => setSelectedLog(null)} 
+      <LogViewer
+        logFile={selectedLog}
+        live={liveMode}
+        onBack={() => { setSelectedLog(null); setLiveMode(false); }}
       />
     );
   }
@@ -146,6 +181,21 @@ export function Dashboard() {
                   Upload Log File
                 </h2>
                 <FileUploader onFileLoaded={handleFileLoaded} />
+                <div className="mt-3 flex items-center gap-3">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setLiveMode(true)}
+                    className="font-mono text-xs"
+                  >
+                    <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse mr-2" />
+                    Watch Live
+                  </Button>
+                  <span className="text-[10px] text-muted-foreground font-mono">
+                    polls <code>/logs/live.jsonl</code> every 4s — feed with{' '}
+                    <code>scripts/watch_rlm_live.sh</code>
+                  </span>
+                </div>
               </div>
               
               {/* ASCII Architecture Diagram */}

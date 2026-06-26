@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Live trajectory mirror (scripts/watch_rlm_live.sh)
+public/logs/
