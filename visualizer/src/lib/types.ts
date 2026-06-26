@@ -51,11 +51,21 @@ export interface RLMConfigMetadata {
 }
 
 // Per-iteration timing decomposition, derived from data already in the log.
+// lmGen + codePure + subCall === total always; lmGenKnown is false when
+// iteration_time was not logged, in which case lmGen is 0 but truly unknown.
 export interface IterationTiming {
-  total: number;     // iteration_time (LM generation + all code execution)
-  lmGen: number;     // root-model response generation
+  total: number;     // best-known total (>= measured code time)
+  lmGen: number;     // root-model response generation (0 when unknown)
   codePure: number;  // Python REPL execution, excluding sub-LM calls made during exec
   subCall: number;   // sum of sub-LM (rlm_query) call latencies
+  lmGenKnown: boolean;
+}
+
+// Lightweight recent-trace descriptor shared by /api/logs and the dashboard.
+export interface RecentTrace {
+  name: string;
+  size: number;
+  mtime: number;
 }
 
 export interface RLMLogFile {

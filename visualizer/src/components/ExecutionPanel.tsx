@@ -7,7 +7,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { CodeBlock } from './CodeBlock';
 import { TimingBreakdown } from './TimingBreakdown';
 import { RLMIteration } from '@/lib/types';
-import { getIterationTiming } from '@/lib/parse-logs';
+import { getIterationTiming } from '@/lib/timing';
 
 interface ExecutionPanelProps {
   iteration: RLMIteration | null;

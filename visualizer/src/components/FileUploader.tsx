@@ -4,19 +4,10 @@ import { useCallback, useState } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+import { MAX_SAFE_BYTES, confirmLargeFile } from '@/lib/format';
 
 interface FileUploaderProps {
   onFileLoaded: (fileName: string, content: string) => void;
-}
-
-// The uploader reads the whole file into memory via file.text(); past this size the
-// browser tab risks freezing. Warn (don't silently crash) and point at the trimmer.
-const MAX_SAFE_BYTES = 150 * 1024 * 1024;
-
-function formatBytes(bytes: number): string {
-  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
-  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-  return `${(bytes / 1024).toFixed(0)} KB`;
 }
 
 export function FileUploader({ onFileLoaded }: FileUploaderProps) {
@@ -30,13 +21,7 @@ export function FileUploader({ onFileLoaded }: FileUploaderProps) {
       setError('Please upload a .jsonl file');
       return;
     }
-    if (file.size > MAX_SAFE_BYTES) {
-      const ok = window.confirm(
-        `${file.name} is ${formatBytes(file.size)} — loading it may freeze the browser.\n` +
-        `Consider trimming it first (scripts/trim_rlm_log.py). Load anyway?`
-      );
-      if (!ok) return;
-    }
+    if (file.size > MAX_SAFE_BYTES && !confirmLargeFile(file.name, file.size)) return;
 
     setIsLoading(true);
     try {

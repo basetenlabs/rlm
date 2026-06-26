@@ -5,6 +5,7 @@ import { Badge } from '@/components/ui/badge';
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { RLMIteration, extractFinalAnswer } from '@/lib/types';
+import { getIterationTiming, formatDuration } from '@/lib/timing';
 
 interface IterationTimelineProps {
   iterations: RLMIteration[];
@@ -14,31 +15,26 @@ interface IterationTimelineProps {
 
 function getIterationStats(iteration: RLMIteration) {
   let totalSubCalls = 0;
-  let codeExecTime = 0;
   let hasError = false;
-  
+
   for (const block of iteration.code_blocks) {
     if (block.result) {
-      codeExecTime += block.result.execution_time || 0;
       if (block.result.stderr) hasError = true;
       if (block.result.rlm_calls) {
         totalSubCalls += block.result.rlm_calls.length;
       }
     }
   }
-  
-  // Use iteration_time if available, otherwise fall back to code execution time
-  const iterTime = iteration.iteration_time ?? codeExecTime;
-  
-  // Estimate token counts from prompt (rough estimation)
+
+  // Estimate token counts from prompt (root-model usage isn't logged → rough estimate)
   const promptText = iteration.prompt.map(m => m.content).join('');
   const estimatedInputTokens = Math.round(promptText.length / 4);
   const estimatedOutputTokens = Math.round(iteration.response.length / 4);
-  
+
   return {
     codeBlocks: iteration.code_blocks.length,
     subCalls: totalSubCalls,
-    execTime: iterTime,
+    execTime: getIterationTiming(iteration).total,
     hasError,
     hasFinal: iteration.final_answer !== null,
     inputTokens: estimatedInputTokens,
@@ -148,7 +144,7 @@ export function IterationTimeline({
                         </span>
                       )}
                       <span className="text-[10px] text-muted-foreground ml-auto">
-                        {stats.execTime.toFixed(2)}s
+                        {formatDuration(stats.execTime)}
                       </span>
                     </div>
                     

@@ -1,4 +1,5 @@
-import { RLMIteration, RLMLogFile, LogMetadata, RLMConfigMetadata, IterationTiming, extractFinalAnswer } from './types';
+import { RLMIteration, RLMLogFile, LogMetadata, RLMConfigMetadata, extractFinalAnswer } from './types';
+import { getIterationTiming } from './timing';
 
 // Real harness logs record sub-call token usage under `usage_summary`, shaped like
 //   { model_usage_summaries: { "<model>": { total_input_tokens, total_output_tokens } } }
@@ -22,7 +23,9 @@ function sumUsage(usage: Record<string, unknown> | undefined, kind: 'input' | 'o
   return typeof flat === 'number' ? flat : 0;
 }
 
-function normalizeIteration(iter: RLMIteration): RLMIteration {
+// Mutates the freshly-parsed iteration in place, filling flat token fields from
+// the nested usage_summary so the UI can rely on prompt_tokens/completion_tokens.
+function normalizeIteration(iter: RLMIteration): void {
   for (const block of iter.code_blocks ?? []) {
     for (const call of block.result?.rlm_calls ?? []) {
       if (typeof call.prompt_tokens !== 'number') {
@@ -33,39 +36,6 @@ function normalizeIteration(iter: RLMIteration): RLMIteration {
       }
     }
   }
-  return iter;
-}
-
-// Decompose an iteration's wall-clock into LM-generation / pure-code / sub-call time.
-// All values come from data already in the log (see IterationTiming).
-export function getIterationTiming(iter: RLMIteration): IterationTiming {
-  let codeTotal = 0;
-  let subCall = 0;
-  for (const block of iter.code_blocks ?? []) {
-    codeTotal += block.result?.execution_time ?? 0;
-    for (const call of block.result?.rlm_calls ?? []) {
-      subCall += call.execution_time ?? 0;
-    }
-  }
-  const total = iter.iteration_time ?? codeTotal;
-  const lmGen = Math.max(0, total - codeTotal);
-  const codePure = Math.max(0, codeTotal - subCall);
-  return { total, lmGen, codePure, subCall };
-}
-
-// Extract the context variable from code block locals
-export function extractContextVariable(iterations: RLMIteration[]): string | null {
-  for (const iter of iterations) {
-    for (const block of iter.code_blocks) {
-      if (block.result?.locals?.context) {
-        const ctx = block.result.locals.context;
-        if (typeof ctx === 'string') {
-          return ctx;
-        }
-      }
-    }
-  }
-  return null;
 }
 
 // Default config when metadata is not present (backwards compatibility)
@@ -112,7 +82,9 @@ export function parseJSONL(content: string): ParsedJSONL {
         };
       } else {
         // This is an iteration entry
-        iterations.push(normalizeIteration(parsed as RLMIteration));
+        const iter = parsed as RLMIteration;
+        normalizeIteration(iter);
+        iterations.push(iter);
       }
     } catch (e) {
       console.error('Failed to parse line:', line, e);
@@ -182,18 +154,8 @@ export function computeMetadata(iterations: RLMIteration[]): LogMetadata {
   
   for (const iter of iterations) {
     totalCodeBlocks += iter.code_blocks.length;
-    
-    // Use iteration_time if available, otherwise sum code block times
-    if (iter.iteration_time != null) {
-      totalExecutionTime += iter.iteration_time;
-    } else {
-      for (const block of iter.code_blocks) {
-        if (block.result) {
-          totalExecutionTime += block.result.execution_time || 0;
-        }
-      }
-    }
-    
+    totalExecutionTime += getIterationTiming(iter).total;
+
     for (const block of iter.code_blocks) {
       if (block.result) {
         if (block.result.stderr) {

@@ -12,6 +12,7 @@ import { IterationTimeline } from './IterationTimeline';
 import { RunTimeline } from './RunTimeline';
 import { ThemeToggle } from './ThemeToggle';
 import { RLMLogFile } from '@/lib/types';
+import { formatDuration } from '@/lib/timing';
 
 interface LogViewerProps {
   logFile: RLMLogFile;
@@ -157,10 +158,10 @@ export function LogViewer({ logFile, onBack, live = false }: LogViewerProps) {
             />
             <StatsCard
               label="Exec"
-              value={`${metadata.totalExecutionTime.toFixed(2)}s`}
+              value={formatDuration(metadata.totalExecutionTime)}
               icon="⏱"
               variant="yellow"
-              subtext={config.parse_seconds != null ? `parse ${config.parse_seconds.toFixed(1)}s` : undefined}
+              subtext={config.parse_seconds != null ? `parse ${formatDuration(config.parse_seconds)}` : undefined}
             />
           </div>
         </div>

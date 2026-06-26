@@ -10,30 +10,14 @@ import { AsciiRLM } from './AsciiGlobe';
 import { ThemeToggle } from './ThemeToggle';
 import { Button } from '@/components/ui/button';
 import { parseLogFile } from '@/lib/parse-logs';
-import { RLMLogFile } from '@/lib/types';
+import { RLMLogFile, RecentTrace } from '@/lib/types';
+import { MAX_SAFE_BYTES, formatBytes, confirmLargeFile } from '@/lib/format';
 import { cn } from '@/lib/utils';
-
-// Files larger than this are too big to safely read into the browser in one shot;
-// nudge the user toward trimming instead of crashing the tab.
-const MAX_SAFE_BYTES = 150 * 1024 * 1024;
-
-function formatBytes(bytes: number): string {
-  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
-  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${bytes} B`;
-}
-
-interface DemoLogInfo {
-  fileName: string;
-  size: number;
-  mtime: number;
-}
 
 export function Dashboard() {
   const [logFiles, setLogFiles] = useState<RLMLogFile[]>([]);
   const [selectedLog, setSelectedLog] = useState<RLMLogFile | null>(null);
-  const [demoLogs, setDemoLogs] = useState<DemoLogInfo[]>([]);
+  const [demoLogs, setDemoLogs] = useState<RecentTrace[]>([]);
   const [loadingDemos, setLoadingDemos] = useState(true);
   // Live mode: poll a continuously-mirrored trajectory and re-render as it grows.
   // Feed it with `scripts/watch_rlm_live.sh <run-id>` (writes public/logs/live.jsonl).
@@ -48,13 +32,7 @@ export function Dashboard() {
         const listResponse = await fetch('/api/logs');
         if (!listResponse.ok) throw new Error('Failed to fetch log list');
         const { files } = await listResponse.json();
-        setDemoLogs(
-          (files as Array<{ name: string; size: number; mtime: number }>).map((f) => ({
-            fileName: f.name,
-            size: f.size,
-            mtime: f.mtime,
-          }))
-        );
+        setDemoLogs(files as RecentTrace[]);
       } catch (e) {
         console.error('Failed to load recent traces:', e);
       } finally {
@@ -105,14 +83,8 @@ export function Dashboard() {
     setSelectedLog(parsed);
   }, []);
 
-  const loadDemoLog = useCallback(async (fileName: string, size?: number) => {
-    if (size != null && size > MAX_SAFE_BYTES) {
-      const ok = window.confirm(
-        `${fileName} is ${formatBytes(size)} — loading it may freeze the browser.\n` +
-        `Consider trimming it first (scripts/trim_rlm_log.py). Load anyway?`
-      );
-      if (!ok) return;
-    }
+  const loadDemoLog = useCallback(async (fileName: string, size: number) => {
+    if (size > MAX_SAFE_BYTES && !confirmLargeFile(fileName, size)) return;
     try {
       const response = await fetch(`/logs/${fileName}`);
       if (!response.ok) throw new Error('Failed to load demo log');
@@ -238,8 +210,8 @@ export function Dashboard() {
                     <div className="space-y-2 pr-4">
                       {demoLogs.map((demo) => (
                         <Card
-                          key={demo.fileName}
-                          onClick={() => loadDemoLog(demo.fileName, demo.size)}
+                          key={demo.name}
+                          onClick={() => loadDemoLog(demo.name, demo.size)}
                           className={cn(
                             'cursor-pointer transition-all hover:scale-[1.01]',
                             'hover:border-primary/50 hover:bg-primary/5'
@@ -251,7 +223,7 @@ export function Dashboard() {
                               <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-2">
                                   <span className="font-mono text-xs text-foreground/80 truncate">
-                                    {demo.fileName}
+                                    {demo.name}
                                   </span>
                                   <Badge
                                     variant="outline"
