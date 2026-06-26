@@ -163,13 +163,13 @@ export function CodeBlock({ block, index }: CodeBlockProps) {
                         </div>
                       </div>
                       <div className="text-xs text-muted-foreground mb-1">Prompt:</div>
-                      <div className="text-sm bg-muted rounded p-2 mb-2 max-h-24 overflow-y-auto border border-border">
-                        {typeof call.prompt === 'string' 
+                      <div className="text-xs bg-muted rounded p-2 mb-2 max-h-24 overflow-y-auto border border-border whitespace-pre-wrap break-words font-mono">
+                        {typeof call.prompt === 'string'
                           ? call.prompt.slice(0, 500) + (call.prompt.length > 500 ? '...' : '')
                           : JSON.stringify(call.prompt).slice(0, 500)}
                       </div>
                       <div className="text-xs text-muted-foreground mb-1">Response:</div>
-                      <div className="text-sm bg-muted rounded p-2 max-h-24 overflow-y-auto border border-border">
+                      <div className="text-xs bg-muted rounded p-2 max-h-24 overflow-y-auto border border-border whitespace-pre-wrap break-words font-mono">
                         {call.response.slice(0, 500) + (call.response.length > 500 ? '...' : '')}
                       </div>
                     </div>
