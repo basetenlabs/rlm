@@ -63,9 +63,12 @@ export interface IterationTiming {
 
 // Lightweight recent-trace descriptor shared by /api/logs and the dashboard.
 export interface RecentTrace {
-  name: string;
+  name: string;            // path relative to public/logs/, e.g. "live/pinnacle-heartland.jsonl"
   size: number;
   mtime: number;
+  task?: string;           // derived task slug, e.g. "pinnacle-heartland"
+  isLive?: boolean;        // mtime is fresh (actively being mirrored)
+  iterationCount?: number; // iteration records in the file (best-effort)
 }
 
 export interface RLMLogFile {

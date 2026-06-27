@@ -22,42 +22,51 @@ export function Dashboard() {
   // Live mode: poll a continuously-mirrored trajectory and re-render as it grows.
   // Feed it with `scripts/watch_rlm_live.sh <run-id>` (writes public/logs/live.jsonl).
   const [liveMode, setLiveMode] = useState(false);
-  const LIVE_FILE = 'live.jsonl';
+  // Which mirrored file the live poller is following. Single-run "Watch Live" uses
+  // 'live.jsonl'; the run picker switches this to e.g. 'live/pinnacle-heartland.jsonl'.
+  const [activeLiveFile, setActiveLiveFile] = useState<string>('live.jsonl');
 
-  // Load the recent-traces list on mount. The API returns only name/size/mtime,
-  // so we never pull whole (potentially multi-GB) log files into memory here.
+  // Recent-traces list (name/size/mtime/task/isLive/iterationCount) — refreshed on a
+  // timer so new concurrent runs appear and live status stays current. The API never
+  // returns file contents, so this stays cheap.
   useEffect(() => {
-    async function loadDemoPreviews() {
+    let cancelled = false;
+    const refresh = async () => {
       try {
-        const listResponse = await fetch('/api/logs');
-        if (!listResponse.ok) throw new Error('Failed to fetch log list');
-        const { files } = await listResponse.json();
-        setDemoLogs(files as RecentTrace[]);
+        const res = await fetch('/api/logs', { cache: 'no-store' });
+        if (!res.ok || cancelled) return;
+        const { files } = await res.json();
+        if (!cancelled) setDemoLogs(files as RecentTrace[]);
       } catch (e) {
         console.error('Failed to load recent traces:', e);
       } finally {
-        setLoadingDemos(false);
+        if (!cancelled) setLoadingDemos(false);
       }
-    }
-
-    loadDemoPreviews();
+    };
+    refresh();
+    const id = setInterval(refresh, 10000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
 
-  // Live polling: re-fetch the mirrored trajectory and update the open log.
+  // Live polling: re-fetch the active mirrored trajectory and update the open log.
   useEffect(() => {
-    if (!liveMode) return;
+    if (!liveMode || !activeLiveFile) return;
     let cancelled = false;
+    const file = activeLiveFile;
     const poll = async () => {
       try {
-        const res = await fetch(`/logs/${LIVE_FILE}?t=${Date.now()}`, { cache: 'no-store' });
+        const res = await fetch(`/logs/${file}?t=${Date.now()}`, { cache: 'no-store' });
         if (!res.ok || cancelled) return;
         const content = await res.text();
         if (cancelled || !content.trim()) return;
-        const parsed = parseLogFile(LIVE_FILE, content);
+        const parsed = parseLogFile(file, content);
         setSelectedLog(parsed);
         setLogFiles(prev =>
-          prev.some(f => f.fileName === LIVE_FILE)
-            ? prev.map(f => (f.fileName === LIVE_FILE ? parsed : f))
+          prev.some(f => f.fileName === file)
+            ? prev.map(f => (f.fileName === file ? parsed : f))
             : [...prev, parsed]
         );
       } catch {
@@ -70,7 +79,7 @@ export function Dashboard() {
       cancelled = true;
       clearInterval(id);
     };
-  }, [liveMode]);
+  }, [liveMode, activeLiveFile]);
 
   const handleFileLoaded = useCallback((fileName: string, content: string) => {
     const parsed = parseLogFile(fileName, content);
@@ -95,6 +104,17 @@ export function Dashboard() {
       alert('Failed to load demo log. Make sure the log files are in the public/logs folder.');
     }
   }, [handleFileLoaded]);
+
+  // Pick a run from the list: live runs start tail-following; finished runs load statically.
+  const selectRun = useCallback((trace: RecentTrace) => {
+    if (trace.isLive) {
+      setActiveLiveFile(trace.name);
+      setLiveMode(true);
+    } else {
+      setLiveMode(false);
+      loadDemoLog(trace.name, trace.size);
+    }
+  }, [loadDemoLog]);
 
   if (selectedLog) {
     return (
@@ -187,8 +207,8 @@ export function Dashboard() {
               <div>
                 <h2 className="text-sm font-medium mb-3 flex items-center gap-2 text-muted-foreground">
                   <span className="text-primary font-mono">02</span>
-                  Recent Traces
-                  <span className="text-[10px] text-muted-foreground/60 ml-1">(latest 10)</span>
+                  Runs
+                  <span className="text-[10px] text-muted-foreground/60 ml-1">(live + recent, by task)</span>
                 </h2>
                 
                 {loadingDemos ? (
@@ -211,29 +231,47 @@ export function Dashboard() {
                       {demoLogs.map((demo) => (
                         <Card
                           key={demo.name}
-                          onClick={() => loadDemoLog(demo.name, demo.size)}
+                          onClick={() => selectRun(demo)}
                           className={cn(
                             'cursor-pointer transition-all hover:scale-[1.01]',
-                            'hover:border-primary/50 hover:bg-primary/5'
+                            'hover:border-primary/50 hover:bg-primary/5',
+                            demo.isLive && 'border-red-500/40'
                           )}
                         >
                           <CardContent className="p-3">
                             <div className="flex items-center gap-3">
-                              <div className="w-2.5 h-2.5 rounded-full bg-muted-foreground/30 flex-shrink-0" />
+                              <div className="relative flex-shrink-0">
+                                <div className={cn(
+                                  'w-2.5 h-2.5 rounded-full',
+                                  demo.isLive ? 'bg-red-500' : 'bg-muted-foreground/30'
+                                )} />
+                                {demo.isLive && (
+                                  <div className="absolute inset-0 w-2.5 h-2.5 rounded-full bg-red-500 animate-ping opacity-60" />
+                                )}
+                              </div>
                               <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-2">
                                   <span className="font-mono text-xs text-foreground/80 truncate">
-                                    {demo.name}
+                                    {demo.task ?? demo.name}
                                   </span>
-                                  <Badge
-                                    variant="outline"
-                                    className={cn(
-                                      'text-[9px] px-1.5 py-0 h-4 ml-auto flex-shrink-0',
-                                      demo.size > MAX_SAFE_BYTES && 'border-amber-500/50 text-amber-600 dark:text-amber-400'
-                                    )}
-                                  >
-                                    {formatBytes(demo.size)}
-                                  </Badge>
+                                  {demo.isLive ? (
+                                    <Badge
+                                      variant="outline"
+                                      className="text-[9px] px-1.5 py-0 h-4 ml-auto flex-shrink-0 border-red-500/50 text-red-500"
+                                    >
+                                      LIVE{demo.iterationCount != null ? ` • ${demo.iterationCount}` : ''}
+                                    </Badge>
+                                  ) : (
+                                    <Badge
+                                      variant="outline"
+                                      className={cn(
+                                        'text-[9px] px-1.5 py-0 h-4 ml-auto flex-shrink-0',
+                                        demo.size > MAX_SAFE_BYTES && 'border-amber-500/50 text-amber-600 dark:text-amber-400'
+                                      )}
+                                    >
+                                      {formatBytes(demo.size)}
+                                    </Badge>
+                                  )}
                                 </div>
                               </div>
                             </div>
