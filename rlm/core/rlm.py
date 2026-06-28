@@ -432,6 +432,7 @@ class RLM:
                     self.verbose.print_iteration(iteration, i + 1)
 
                     if final_answer is not None:
+                        final_answer = self._recover_if_stub(final_answer, environment)
                         time_end = time.perf_counter()
                         usage = lm_handler.get_usage_summary()
                         self.verbose.print_final_answer(final_answer)
@@ -470,6 +471,7 @@ class RLM:
             # Default behavior: we run out of iterations, provide one final answer
             time_end = time.perf_counter()
             final_answer = self._default_answer(message_history, lm_handler)
+            final_answer = self._recover_if_stub(final_answer, environment)
             usage = lm_handler.get_usage_summary()
             self.verbose.print_final_answer(final_answer)
             self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
@@ -488,6 +490,30 @@ class RLM:
                 execution_time=time_end - time_start,
                 metadata=self.logger.get_trajectory() if self.logger else None,
             )
+
+    def _recover_if_stub(self, answer: str | None, environment) -> str | None:
+        """Safety net for finalize-protocol non-compliance.
+
+        Some models (e.g. DeepSeek V4 Pro) build the full deliverable in a REPL
+        variable but then set ``answer["content"]`` to a short confirmation
+        ("the report has been saved to ..."), producing a stub. When the final
+        answer is suspiciously short, recover the largest report-like string
+        from the REPL namespace (``environment.locals``) instead. Model- and
+        variable-name-agnostic: scans all user string variables.
+        """
+        text = answer or ""
+        if len(text) >= 5000:
+            return answer
+        locals_ = getattr(environment, "locals", None)
+        if not isinstance(locals_, dict):
+            return answer
+        best = text
+        for key, val in locals_.items():
+            if key in ("answer", "context", "history") or key.startswith("_"):
+                continue
+            if isinstance(val, str) and len(val) > len(best) and ("#" in val or len(val) > 5000):
+                best = val
+        return best if len(best) > len(text) else answer
 
     def _check_timeout(self, iteration: int, time_start: float) -> None:
         """Raise TimeoutExceededError if the timeout has been exceeded."""
