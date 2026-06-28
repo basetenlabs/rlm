@@ -212,6 +212,10 @@ class RLMIteration:
     code_blocks: list[CodeBlock]
     final_answer: str | None = None
     iteration_time: float | None = None
+    # Per-iteration ROOT-model token usage ({"total_input_tokens", "total_output_tokens"}).
+    # Sub-call usage lives in code_blocks[].result.rlm_calls[]; logging the root here makes the
+    # run's total token count independently re-derivable from the trajectory.
+    root_usage: dict[str, int] | None = None
 
     def to_dict(self):
         return {
@@ -220,6 +224,7 @@ class RLMIteration:
             "code_blocks": [code_block.to_dict() for code_block in self.code_blocks],
             "final_answer": self.final_answer,
             "iteration_time": self.iteration_time,
+            "root_usage": self.root_usage,
         }
 
 

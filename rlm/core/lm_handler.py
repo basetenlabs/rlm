@@ -11,7 +11,7 @@ from threading import Thread
 
 from rlm.clients.base_lm import BaseLM
 from rlm.core.comms_utils import LMRequest, LMResponse, socket_recv, socket_send
-from rlm.core.types import RLMChatCompletion, UsageSummary
+from rlm.core.types import ModelUsageSummary, RLMChatCompletion, UsageSummary
 
 
 class LMRequestHandler(StreamRequestHandler):
@@ -82,7 +82,19 @@ class LMRequestHandler(StreamRequestHandler):
     def _handle_batched(self, request: LMRequest, handler: "LMHandler") -> LMResponse:
         """Handle a batched prompts request using async for concurrency."""
         client = handler.get_client(request.model, request.depth)
+        root_model = request.model or client.model_name
 
+        def _cum() -> tuple[int, int]:
+            # Cumulative (running) usage for this model. Used to attribute the EXACT
+            # batch total below — get_last_usage() is only the LAST call, so sharing
+            # it across all N completions made the per-call trajectory N-count.
+            try:
+                ms = client.get_usage_summary().model_usage_summaries.get(root_model)
+                return (int(ms.total_input_tokens), int(ms.total_output_tokens)) if ms else (0, 0)
+            except Exception:
+                return (0, 0)
+
+        pre_in, pre_out = _cum()
         start_time = time.perf_counter()
 
         sem = asyncio.Semaphore(handler.batch_max_concurrent)
@@ -99,13 +111,25 @@ class LMRequestHandler(StreamRequestHandler):
 
         results = asyncio.run(run_all())
         end_time = time.perf_counter()
-
         total_time = end_time - start_time
-        model_usage = client.get_last_usage()
-        root_model = request.model or client.model_name
-        usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
+
+        post_in, post_out = _cum()
+        n_ok = sum(1 for c in results if not isinstance(c, BaseException))
+        # Attribute the batch's TRUE total usage (the cumulative delta = sum of every
+        # call in this batch) to the FIRST successful completion, zero to the rest, so
+        # the trajectory's per-call rlm_calls sum to the exact batch total. The client's
+        # accumulation stays authoritative; this only fixes how usage is logged per-entry.
+        batch_usage = UsageSummary(model_usage_summaries={
+            root_model: ModelUsageSummary(
+                total_calls=n_ok,
+                total_input_tokens=post_in - pre_in,
+                total_output_tokens=post_out - pre_out,
+            )
+        })
+        empty_usage = UsageSummary(model_usage_summaries={})
 
         chat_completions = []
+        first_ok = True
         for prompt, content in zip(request.prompts, results, strict=True):
             if isinstance(content, BaseException):
                 # Per-prompt failure: this slot returns an error; other prompts
@@ -115,7 +139,7 @@ class LMRequestHandler(StreamRequestHandler):
                         root_model=root_model,
                         prompt=prompt,
                         response="",
-                        usage_summary=UsageSummary(model_usage_summaries={}),
+                        usage_summary=empty_usage,
                         execution_time=0.0,
                         error=f"llm() call failed - {content}",
                     )
@@ -126,11 +150,11 @@ class LMRequestHandler(StreamRequestHandler):
                         root_model=root_model,
                         prompt=prompt,
                         response=content,
-                        usage_summary=usage_summary,
-                        execution_time=total_time
-                        / len(request.prompts),  # approximate per-prompt time
+                        usage_summary=batch_usage if first_ok else empty_usage,
+                        execution_time=total_time / len(request.prompts),
                     )
                 )
+                first_ok = False
 
         return LMResponse.batched_success_response(chat_completions=chat_completions)
 

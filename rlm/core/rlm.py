@@ -38,6 +38,22 @@ from rlm.utils.rlm_utils import filter_sensitive_keys
 from rlm.utils.token_utils import count_tokens, get_context_limit
 
 
+def _capture_root_usage(lm_handler) -> dict[str, int] | None:
+    """Snapshot the last ROOT-model call's token usage from the default client.
+
+    Called right after the root completion (before sub-calls, which use a different
+    client). Returns {"total_input_tokens", "total_output_tokens"} or None.
+    """
+    try:
+        u = lm_handler.default_client.get_last_usage()
+        return {
+            "total_input_tokens": int(u.total_input_tokens or 0),
+            "total_output_tokens": int(u.total_output_tokens or 0),
+        }
+    except Exception:
+        return None
+
+
 class RLM:
     """
     Recursive Language Model class that the user instantiates and runs on their tasks.
@@ -681,6 +697,10 @@ class RLM:
         """
         iter_start = time.perf_counter()
         response = lm_handler.completion(prompt)
+        # Capture this iteration's ROOT-model usage BEFORE code execution fires any
+        # sub-calls (which go through a different client), so the trajectory records
+        # root tokens per iteration and the run total is independently re-derivable.
+        root_usage = _capture_root_usage(lm_handler)
         code_block_strs = find_code_blocks(response)
         code_blocks = []
 
@@ -694,6 +714,7 @@ class RLM:
             response=response,
             code_blocks=code_blocks,
             iteration_time=iteration_time,
+            root_usage=root_usage,
         )
 
     def _default_answer(self, message_history: list[dict[str, Any]], lm_handler: LMHandler) -> str:
@@ -708,6 +729,7 @@ class RLM:
             }
         ]
         response = lm_handler.completion(current_prompt)
+        root_usage = _capture_root_usage(lm_handler)
 
         if self.logger:
             self.logger.log(
@@ -716,6 +738,7 @@ class RLM:
                     response=response,
                     final_answer=response,
                     code_blocks=[],
+                    root_usage=root_usage,
                 )
             )
 
