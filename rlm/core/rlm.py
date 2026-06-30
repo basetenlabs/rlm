@@ -888,7 +888,16 @@ class RLM:
             on_subcall_complete=self.on_subcall_complete,
         )
         try:
-            result = child.completion(prompt, root_prompt=None)
+            # Without a root_prompt the child receives `prompt` only as its context (no question
+            # turn), so weaker sub-models frequently ECHO the task back instead of executing it.
+            # Give it an explicit directive that points it AT its context and forbids echoing.
+            _child_directive = (
+                "Your context contains a complete, self-contained task: an instruction (what to find "
+                "and the exact output format) followed by the material to analyze. Carry out that task "
+                "fully over your context and return ONLY the requested output. Do NOT restate, "
+                "paraphrase, or echo the instruction, the role description, or the task itself."
+            )
+            result = child.completion(prompt, root_prompt=_child_directive)
             # Track child's cost in parent's cumulative cost
             if result.usage_summary and result.usage_summary.total_cost:
                 self._cumulative_cost += result.usage_summary.total_cost
