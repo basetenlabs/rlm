@@ -71,6 +71,7 @@ class RLM:
         depth: int = 0,
         max_depth: int = 1,
         max_iterations: int = 30,
+        child_max_iterations: int | None = None,
         max_budget: float | None = None,
         max_timeout: float | None = None,
         max_tokens: int | None = None,
@@ -104,6 +105,9 @@ class RLM:
             depth: The current depth of the RLM (0-indexed).
             max_depth: The maximum depth of recursion. When depth >= max_depth, falls back to plain LM completion.
             max_iterations: The maximum number of iterations of the RLM.
+            child_max_iterations: If set, the per-run iteration cap for recursive child RLMs spawned
+                via rlm_query (depth > current). Defaults to None = inherit max_iterations. Use a small
+                value to bound recursive sub-call cost.
             max_budget: Maximum budget in USD. Execution stops if exceeded. Requires cost-tracking backend (e.g., OpenRouter).
             max_timeout: Maximum execution time in seconds. Execution stops if exceeded, returning best answer if available.
             max_tokens: Maximum total tokens (input + output). Execution stops if exceeded, returning best answer if available.
@@ -183,6 +187,7 @@ class RLM:
         self.depth = depth
         self.max_depth = max_depth
         self.max_iterations = max_iterations
+        self.child_max_iterations = child_max_iterations
         self.max_budget = max_budget
         self.max_timeout = max_timeout
         self.max_tokens = max_tokens
@@ -861,7 +866,8 @@ class RLM:
             environment_kwargs=self.environment_kwargs,
             depth=next_depth,
             max_depth=self.max_depth,
-            max_iterations=self.max_iterations,
+            max_iterations=(self.child_max_iterations or self.max_iterations),
+            child_max_iterations=self.child_max_iterations,
             max_budget=remaining_budget,
             max_timeout=remaining_timeout,
             max_tokens=self.max_tokens,
