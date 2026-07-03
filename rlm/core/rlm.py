@@ -707,7 +707,10 @@ class RLM:
         and code execution + tool execution.
         """
         iter_start = time.perf_counter()
-        response = lm_handler.completion(prompt)
+        # `or ""`: reasoning models can return content=None (reasoning-only
+        # turn, e.g. GLM with thinking enabled); treat as an empty response
+        # instead of crashing find_code_blocks with a TypeError.
+        response = lm_handler.completion(prompt) or ""
         # Capture this iteration's ROOT-model usage BEFORE code execution fires any
         # sub-calls (which go through a different client), so the trajectory records
         # root tokens per iteration and the run total is independently re-derivable.
