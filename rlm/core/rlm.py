@@ -95,6 +95,7 @@ class RLM:
         sub_sampling_args: dict[str, Any] | None = None,
         orchestrator: bool = True,
         user_prologue: str | None = None,
+        repl_output_cap: int = 20000,
     ):
         """
         Args:
@@ -199,6 +200,11 @@ class RLM:
         # ``user_prologue`` so canonical inference can match envs that
         # depend on a task-specific tips message (e.g. BC+).
         self.user_prologue = user_prologue
+        # Per-code-block cap on REPL output fed back into the root's message
+        # history (see utils.parsing.format_iteration). The 20K default keeps
+        # the root context small on huge data rooms; raise it to let the root
+        # read full documents directly on small ones.
+        self.repl_output_cap = repl_output_cap
         self.logger = logger
         self.verbose = VerbosePrinter(enabled=verbose)
 
@@ -475,7 +481,7 @@ class RLM:
                         )
 
                     # Format the iteration for the next prompt.
-                    new_messages = format_iteration(iteration)
+                    new_messages = format_iteration(iteration, max_character_length=self.repl_output_cap)
 
                     # Update message history with the new messages.
                     message_history.extend(new_messages)
