@@ -1,3 +1,4 @@
+import json
 import os
 from collections import defaultdict
 from typing import Any
@@ -16,6 +17,35 @@ DEFAULT_OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DEFAULT_VERCEL_API_KEY = os.getenv("AI_GATEWAY_API_KEY")
 DEFAULT_PRIME_API_KEY = os.getenv("PRIME_API_KEY")
 DEFAULT_PRIME_INTELLECT_BASE_URL = "https://api.pinference.ai/api/v1/"
+
+
+def _maybe_dump_reasoning(response: Any, model: str) -> None:
+    """Opt-in reasoning capture (set RLM_REASONING_DUMP=<path>).
+
+    Served reasoning models (e.g. GLM with thinking enabled) return their
+    chain-of-thought in a separate ``reasoning_content`` field that never
+    reaches ``message.content`` — and therefore never reaches history or the
+    trajectory. Persist it as one JSONL row per call so trajectories can be
+    joined (by call order) with the reasoning that produced each response.
+    History is deliberately left untouched: chat templates exclude prior
+    thinking, so re-embedding it would change model behavior.
+    """
+    path = os.environ.get("RLM_REASONING_DUMP")
+    if not path:
+        return
+    try:
+        msg = response.choices[0].message
+        reasoning = getattr(msg, "reasoning_content", None)
+        if not reasoning:
+            return
+        with open(path, "a") as f:
+            f.write(json.dumps({
+                "model": model,
+                "reasoning": reasoning,
+                "content_head": (msg.content or "")[:80],
+            }, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass  # never let debug capture break a rollout
 
 
 def _normalize_sampling_args(sampling_args: dict[str, Any]) -> dict[str, Any]:
@@ -115,6 +145,7 @@ class OpenAIClient(BaseLM):
             **_normalize_sampling_args(self.sampling_args),
         )
         self._track_cost(response, model)
+        _maybe_dump_reasoning(response, model)
         return response.choices[0].message.content
 
     async def acompletion(
@@ -143,6 +174,7 @@ class OpenAIClient(BaseLM):
             **_normalize_sampling_args(self.sampling_args),
         )
         self._track_cost(response, model)
+        _maybe_dump_reasoning(response, model)
         return response.choices[0].message.content
 
     def _track_cost(self, response: openai.ChatCompletion, model: str):
