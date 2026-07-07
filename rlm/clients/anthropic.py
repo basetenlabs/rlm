@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 import time
 from collections import defaultdict
 from typing import Any
@@ -109,11 +110,15 @@ class AnthropicClient(BaseLM):
                 thinking_parts.append(block.thinking)
         return "".join(text_parts), "\n".join(thinking_parts)
 
-    # SDK max_retries covers only the initial request; a 5xx/429 arriving
+    # SDK max_retries covers only the initial request; a 5xx/429/529 arriving
     # MID-STREAM raises through get_final_message() unretried (observed live:
-    # api_error 500 partway into an Opus stream). Retry those here so a blip
-    # costs seconds, not a whole RLM iteration against the error threshold.
-    _STREAM_RETRIES = 3
+    # api_error 500, then overloaded_error 529 storms). 529 storms against the
+    # ~200K-token force-read prefills last 10+ minutes even single-stream, so
+    # ride them out: exponential 15s..240s capped at 300s, ~23 min total,
+    # before giving up and burning an RLM iteration.
+    _STREAM_RETRIES = 8
+    _BACKOFF_BASE_S = 15
+    _BACKOFF_CAP_S = 300
 
     @staticmethod
     def _stream_retryable(e: Exception) -> bool:
@@ -130,7 +135,11 @@ class AnthropicClient(BaseLM):
             except Exception as e:
                 if attempt >= self._STREAM_RETRIES or not self._stream_retryable(e):
                     raise
-                time.sleep(2 ** attempt * 5)
+                wait = min(2 ** attempt * self._BACKOFF_BASE_S, self._BACKOFF_CAP_S)
+                print(f"[anthropic-retry] attempt {attempt + 1}/{self._STREAM_RETRIES} "
+                      f"status={getattr(e, 'status_code', '?')} sleeping {wait}s",
+                      file=sys.stderr, flush=True)
+                time.sleep(wait)
         self._track_cost(response, model)
         text, thinking = self._extract_text(response)
         _maybe_dump_reasoning(thinking, text, model)
@@ -148,7 +157,11 @@ class AnthropicClient(BaseLM):
             except Exception as e:
                 if attempt >= self._STREAM_RETRIES or not self._stream_retryable(e):
                     raise
-                await asyncio.sleep(2 ** attempt * 5)
+                wait = min(2 ** attempt * self._BACKOFF_BASE_S, self._BACKOFF_CAP_S)
+                print(f"[anthropic-retry] attempt {attempt + 1}/{self._STREAM_RETRIES} "
+                      f"status={getattr(e, 'status_code', '?')} sleeping {wait}s",
+                      file=sys.stderr, flush=True)
+                await asyncio.sleep(wait)
         self._track_cost(response, model)
         text, thinking = self._extract_text(response)
         _maybe_dump_reasoning(thinking, text, model)
