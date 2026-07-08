@@ -19,6 +19,22 @@ DEFAULT_PRIME_API_KEY = os.getenv("PRIME_API_KEY")
 DEFAULT_PRIME_INTELLECT_BASE_URL = "https://api.pinference.ai/api/v1/"
 
 
+def _strip_inline_thinking(content: str | None) -> str:
+    """Drop a leading inline <think> block from served stacks with no reasoning
+    parser (e.g. vLLM presets that return "...</think>actual content").
+
+    Without this, thinking text accumulates in the conversation history, the
+    chat template re-mangles it every turn, and models degenerate into token
+    soup after tens of iterations (observed on the Loops GLM sampler,
+    2026-07-08; the TRT dapis are unaffected because their parser splits
+    reasoning server-side).
+    """
+    content = content or ""
+    if "</think>" in content:
+        content = content.split("</think>")[-1].lstrip("\n")
+    return content
+
+
 def _maybe_dump_reasoning(response: Any, model: str) -> None:
     """Opt-in reasoning capture (set RLM_REASONING_DUMP=<path>).
 
@@ -146,7 +162,7 @@ class OpenAIClient(BaseLM):
         )
         self._track_cost(response, model)
         _maybe_dump_reasoning(response, model)
-        return response.choices[0].message.content
+        return _strip_inline_thinking(response.choices[0].message.content)
 
     async def acompletion(
         self, prompt: str | list[dict[str, Any]], model: str | None = None
@@ -175,7 +191,7 @@ class OpenAIClient(BaseLM):
         )
         self._track_cost(response, model)
         _maybe_dump_reasoning(response, model)
-        return response.choices[0].message.content
+        return _strip_inline_thinking(response.choices[0].message.content)
 
     def _track_cost(self, response: openai.ChatCompletion, model: str):
         self.model_call_counts[model] += 1
