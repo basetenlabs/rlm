@@ -205,6 +205,34 @@ ORCHESTRATOR_ADDENDUM = "\n\n".join(
 )
 
 
+# Delegation-neutral addendum for direct/force-read runs (prompt-ablation
+# 2026-07-09): keeps ORCHESTRATOR_ADDENDUM's turn discipline (plan, verify,
+# finalize) but drops the delegation pressure ("orchestrator, not a solver",
+# "push every long-context operation into llm_query", "batch-extract rather
+# than reading by hand", "Delegate everything else"), which contradicts a
+# root prompt that mandates reading the corpus directly.
+DIRECT_READ_ADDENDUM = "\n\n".join(
+    [
+        (
+            "Directly after you probe the `context` and understand your task, pause and plan: "
+            "state explicitly how the task decomposes into REPL steps, and sketch "
+            "the concrete sequence of turns — what each turn computes — like a condensed "
+            "trajectory, before you execute them. "
+            "Then execute one turn at a time: after each step `print` a small sample of the "
+            'result, verify it looks right, and only flip `answer["ready"] = True` once you '
+            "have actually printed the candidate answer. If you are running out of turns "
+            "without a confirmed answer, submit your best inference rather than letting the "
+            "rollout terminate unsubmitted."
+        ),
+        (
+            "Sub-LM calls (`llm_query` / `llm_query_batched`) remain available as optional "
+            "cross-checks on what you read; they have no REPL and only see the prompt and "
+            "the `context` slice you pass them."
+        ),
+    ]
+)
+
+
 _DEFAULT_MAX_ITERATIONS = 30
 
 
@@ -214,6 +242,7 @@ def build_rlm_system_prompt(
     custom_tools: dict[str, Any] | None = None,
     root_prompt: str | None = None,
     orchestrator: bool = True,
+    addendum_variant: str = "orchestrator",
 ) -> list[dict[str, str]]:
     from rlm.environments.base_env import format_tools_for_prompt
 
@@ -227,7 +256,9 @@ def build_rlm_system_prompt(
 
     final_system_prompt = system_prompt.format(custom_tools_section=custom_tools_section)
     if orchestrator:
-        final_system_prompt = f"{final_system_prompt}\n\n{ORCHESTRATOR_ADDENDUM}"
+        addendum = (DIRECT_READ_ADDENDUM if addendum_variant == "direct-read"
+                    else ORCHESTRATOR_ADDENDUM)
+        final_system_prompt = f"{final_system_prompt}\n\n{addendum}"
 
     metadata_body = (
         f"Your context is a {query_metadata.context_type} of "

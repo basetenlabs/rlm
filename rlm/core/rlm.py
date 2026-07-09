@@ -95,6 +95,7 @@ class RLM:
         sampling_args: dict[str, Any] | None = None,
         sub_sampling_args: dict[str, Any] | None = None,
         orchestrator: bool = True,
+        addendum_variant: str = "orchestrator",
         user_prologue: str | None = None,
         repl_output_cap: int = 20000,
         nudge_on_no_code: bool = True,
@@ -197,6 +198,9 @@ class RLM:
         self.max_errors = max_errors
         self.system_prompt = custom_system_prompt if custom_system_prompt else RLM_SYSTEM_PROMPT
         self.orchestrator = orchestrator
+        # "orchestrator" (default) or "direct-read" (delegation-neutral
+        # addendum for force/direct-read roots; see prompts.DIRECT_READ_ADDENDUM).
+        self.addendum_variant = addendum_variant
         # Optional user-prologue message inserted between the metadata user
         # message and the iter-0 turn prompt. Mirrors RLMTrainEnv's
         # ``user_prologue`` so canonical inference can match envs that
@@ -347,6 +351,7 @@ class RLM:
             custom_tools=self.custom_tools,
             root_prompt=root_prompt,
             orchestrator=self.orchestrator,
+            addendum_variant=self.addendum_variant,
         )
         if self.user_prologue:
             message_history.append({"role": "user", "content": self.user_prologue})
