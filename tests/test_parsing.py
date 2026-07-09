@@ -59,6 +59,23 @@ y = 2
         assert len(blocks) == 1
         assert "y = 2" in blocks[0]
 
+    def test_repl_fence_with_trailing_junk_accepted(self):
+        # GLM-5.2 with thinking disabled systematically emits these variants
+        # (598 of 715 fence emissions in the 2026-07-09 nothink probe); the
+        # strict ```repl fence rejected them silently and runs perseverated.
+        for fence in ("```repl Python", "```repl Python block", "```repl  "):
+            text = f"{fence}\nz = 3\nprint(z)\n```"
+            blocks = find_code_blocks(text)
+            assert len(blocks) == 1, fence
+            assert "z = 3" in blocks[0]
+
+    def test_repl_prefixed_languages_still_ignored(self):
+        # "repl" must be the whole tag word: ```replace etc. are not REPL blocks.
+        text = "```replace\nnot code\n```\n```repl\ny = 2\n```"
+        blocks = find_code_blocks(text)
+        assert len(blocks) == 1
+        assert "y = 2" in blocks[0]
+
     def test_multiline_code_block(self):
         text = """```repl
 def factorial(n):
@@ -173,6 +190,30 @@ class TestFormatIteration:
         messages = format_iteration(iteration)
         assert len(messages) == 1
         assert messages[0]["role"] == "assistant"
+
+    def test_no_code_feedback_appended_when_nothing_parsed(self):
+        # A silent no-op turn gives a fenceless/malformed-fence model no signal
+        # to correct itself (2026-07-09 nothink probe: perseveration root cause).
+        iteration = RLMIteration(
+            prompt="Just thinking",
+            response="I need to examine the context structure first.",
+            code_blocks=[],
+        )
+        messages = format_iteration(iteration, no_code_feedback="No ```repl block found.")
+        assert len(messages) == 2
+        assert messages[1]["role"] == "user"
+        assert "No ```repl block found." == messages[1]["content"]
+
+    def test_no_code_feedback_not_appended_when_code_ran(self):
+        code_result = REPLResult(stdout="3", stderr="", locals={})
+        iteration = RLMIteration(
+            prompt="Calculate",
+            response="Running.",
+            code_blocks=[CodeBlock(code="print(3)", result=code_result)],
+        )
+        messages = format_iteration(iteration, no_code_feedback="No ```repl block found.")
+        assert len(messages) == 2
+        assert "REPL output:" in messages[1]["content"]
 
     def test_truncates_long_results(self):
         long_output = "x" * 30000

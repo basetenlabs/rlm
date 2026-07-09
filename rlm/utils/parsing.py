@@ -11,8 +11,13 @@ def find_code_blocks(text: str) -> list[str]:
     """
     Find REPL code blocks in text wrapped in triple backticks and return List of content(s).
     Returns None if no code blocks are found.
+
+    The fence tag tolerates trailing junk after "repl" (e.g. ```repl Python) —
+    GLM-5.2 with thinking disabled emits these variants systematically, and a
+    strict fence silently drops the code (2026-07-09 nothink probe). "repl"
+    must still be the whole first word, so ```replace is not a REPL block.
     """
-    pattern = r"```repl\s*\n(.*?)\n```"
+    pattern = r"```repl(?:[ \t][^\n]*)?\n(.*?)\n```"
     results = []
 
     for match in re.finditer(pattern, text, re.DOTALL):
@@ -22,8 +27,22 @@ def find_code_blocks(text: str) -> list[str]:
     return results
 
 
+# Sent as the user turn when a response contained no parseable ```repl block.
+# Without it the model gets zero corrective signal after a malformed or missing
+# fence and can pattern-lock on its own prior turn (thinking-off GLM-5.2
+# perseverated this way for 80-turn runs; see harvey-labs docs/glm-nothink-probe.md).
+NO_CODE_FEEDBACK = (
+    "No ```repl code block was found in your last message, so nothing was "
+    "executed. To run code, open a block with ```repl on its own line, put "
+    "your Python inside, and close it with ```. Remember that you can only "
+    "inspect the context and produce your final answer through the REPL."
+)
+
+
 def format_iteration(
-    iteration: RLMIteration, max_character_length: int = 20000
+    iteration: RLMIteration,
+    max_character_length: int = 20000,
+    no_code_feedback: str | None = None,
 ) -> list[dict[str, str]]:
     """
     Format an RLM iteration (including all code blocks) to append to the message history for
@@ -44,11 +63,15 @@ def format_iteration(
         iteration: The iteration to format
         max_character_length: Per-block cap on the formatted execution
             result. Longer outputs are tail-trimmed.
+        no_code_feedback: If set and the iteration ran no code, this text is
+            appended as the user reply instead of leaving the turn silent
+            (see NO_CODE_FEEDBACK). If None, no-code turns get no user reply
+            (stock behavior).
 
     Returns:
-        A list of messages to add to the next prompt — always length 1
-        (just the assistant) when no code was run, or length 2 (assistant
-        + one combined user reply) otherwise.
+        A list of messages to add to the next prompt — length 2 (assistant
+        + one combined user reply) when code ran or no_code_feedback is set,
+        else length 1 (just the assistant).
     """
     messages = [{"role": "assistant", "content": iteration.response}]
 
@@ -66,6 +89,8 @@ def format_iteration(
 
     if parts:
         messages.append({"role": "user", "content": "\n\n".join(parts)})
+    elif no_code_feedback:
+        messages.append({"role": "user", "content": no_code_feedback})
     return messages
 
 

@@ -25,6 +25,7 @@ from rlm.utils.exceptions import (
     TokenLimitExceededError,
 )
 from rlm.utils.parsing import (
+    NO_CODE_FEEDBACK,
     find_code_blocks,
     format_iteration,
 )
@@ -96,6 +97,7 @@ class RLM:
         orchestrator: bool = True,
         user_prologue: str | None = None,
         repl_output_cap: int = 20000,
+        nudge_on_no_code: bool = True,
     ):
         """
         Args:
@@ -205,6 +207,11 @@ class RLM:
         # the root context small on huge data rooms; raise it to let the root
         # read full documents directly on small ones.
         self.repl_output_cap = repl_output_cap
+        # Reply with NO_CODE_FEEDBACK when a turn parses no ```repl block.
+        # Stock RLM left such turns silent, which gives a fence-mangling model
+        # no corrective signal and can pattern-lock it (GLM-5.2 thinking-off
+        # perseveration, 2026-07-09 probe). Set False to reproduce old behavior.
+        self.nudge_on_no_code = nudge_on_no_code
         self.logger = logger
         self.verbose = VerbosePrinter(enabled=verbose)
 
@@ -481,7 +488,11 @@ class RLM:
                         )
 
                     # Format the iteration for the next prompt.
-                    new_messages = format_iteration(iteration, max_character_length=self.repl_output_cap)
+                    new_messages = format_iteration(
+                        iteration,
+                        max_character_length=self.repl_output_cap,
+                        no_code_feedback=NO_CODE_FEEDBACK if self.nudge_on_no_code else None,
+                    )
 
                     # Update message history with the new messages.
                     message_history.extend(new_messages)
