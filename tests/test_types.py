@@ -189,6 +189,26 @@ class TestRLMChatCompletion:
         c2 = RLMChatCompletion.from_dict(d)
         assert c2.metadata == trajectory
 
+    def test_deliverables_default_none(self):
+        usage = UsageSummary(model_usage_summaries={})
+        c = RLMChatCompletion(
+            root_model="gpt-4", prompt="hi", response="hello",
+            usage_summary=usage, execution_time=1.0,
+        )
+        assert c.deliverables is None
+        assert "deliverables" not in c.to_dict()
+
+    def test_deliverables_roundtrip(self):
+        usage = UsageSummary(model_usage_summaries={})
+        deliverables = {"a.md": "AAA", "b.md": "BBB"}
+        c = RLMChatCompletion(
+            root_model="gpt-4", prompt="hi", response="rendered",
+            usage_summary=usage, execution_time=1.0, deliverables=deliverables,
+        )
+        d = c.to_dict()
+        assert d["deliverables"] == deliverables
+        assert RLMChatCompletion.from_dict(d).deliverables == deliverables
+
 
 class TestQueryMetadata:
     """Tests for QueryMetadata."""

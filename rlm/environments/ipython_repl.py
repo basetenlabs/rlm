@@ -52,7 +52,7 @@ from rlm.environments.base_env import (
     extract_tool_value,
     validate_custom_tools,
 )
-from rlm.environments.local_repl import _AnswerDict
+from rlm.environments.local_repl import _AnswerDict, normalize_slots
 
 KernelMode = Literal["in_process", "subprocess"]
 
@@ -107,7 +107,7 @@ class _SubcallBroker:
     ``subcall_fn`` finishes after that cell has timed out):
         {"type": "subcall", "prompt": str, "model": str | None, "cell_id": str}
         {"type": "subcall_batched", "prompts": [str], "model": str | None, "cell_id": str}
-        {"type": "answer", "content": str, "cell_id": str}
+        {"type": "answer", "deliverables": dict[str, str], "cell_id": str}
 
     Responses:
         subcall:          {"completion": RLMChatCompletion.to_dict()} | {"error": str}
@@ -139,7 +139,7 @@ class _SubcallBroker:
         # subcall that finishes *after* its origin cell timed out don't
         # get misattributed to a later cell.
         self._completions_by_cell: dict[str, list[RLMChatCompletion]] = {}
-        self._final_answers_by_cell: dict[str, str] = {}
+        self._final_deliverables_by_cell: dict[str, dict[str, str]] = {}
 
     def start(self) -> tuple[str, int]:
         parent = self
@@ -195,9 +195,13 @@ class _SubcallBroker:
         cell_id = data.get("cell_id") or ""
 
         if req_type == "answer":
-            content = data.get("content")
+            deliverables = data.get("deliverables")
+            if not isinstance(deliverables, dict):
+                deliverables = {}
             with self._lock:
-                self._final_answers_by_cell[cell_id] = str(content) if content is not None else ""
+                self._final_deliverables_by_cell[cell_id] = {
+                    str(k): str(v) for k, v in deliverables.items()
+                }
             return {"ok": True}
 
         if req_type == "subcall":
@@ -273,10 +277,12 @@ class _SubcallBroker:
             return (self.host, self._port)
         return (self.host, self._server.server_address[1])
 
-    def drain(self, cell_id: str | None = None) -> tuple[list[RLMChatCompletion], str | None]:
-        """Pop completions and the final answer for a cell, discard the rest.
+    def drain(
+        self, cell_id: str | None = None
+    ) -> tuple[list[RLMChatCompletion], dict[str, str] | None]:
+        """Pop completions and the final deliverables for a cell, discard the rest.
 
-        ``drain(cell_id)`` returns this cell's completions+final and
+        ``drain(cell_id)`` returns this cell's completions+deliverables and
         unconditionally clears any entries belonging to *other* cells —
         those are stragglers from a prior cell that timed out before its
         own ``subcall_fn`` finished, and they must not bleed into a future
@@ -288,14 +294,14 @@ class _SubcallBroker:
         with self._lock:
             if cell_id is None:
                 self._completions_by_cell.clear()
-                self._final_answers_by_cell.clear()
+                self._final_deliverables_by_cell.clear()
                 return [], None
             completions = self._completions_by_cell.pop(cell_id, [])
-            final = self._final_answers_by_cell.pop(cell_id, None)
+            final = self._final_deliverables_by_cell.pop(cell_id, None)
             # Discard stragglers from other (now-defunct) cells so they
             # don't get attributed to a later drain.
             self._completions_by_cell.clear()
-            self._final_answers_by_cell.clear()
+            self._final_deliverables_by_cell.clear()
         return completions, final
 
 
@@ -309,8 +315,13 @@ def _build_kernel_bootstrap(
     subcall_address: tuple[str, int] | None,
     depth: int,
     subcall_timeout: float | None,
+    deliverable_slots: list[str] | None = None,
 ) -> str:
     """Code executed once inside the kernel to wire up scaffold helpers."""
+    # Python literal for the initial answer["deliverables"] seed. Injected as a
+    # single f-string field so the ``{{ }}``-escaped template stays intact.
+    slots = normalize_slots(deliverable_slots)
+    seed_deliverables = {name: "" for name in slots}
     return textwrap.dedent(
         f"""
         import json as _rlm_json
@@ -321,6 +332,7 @@ def _build_kernel_bootstrap(
         _RLM_SUBCALL_ADDRESS = {list(subcall_address) if subcall_address else None!r}
         _RLM_DEPTH = {depth}
         _RLM_SUBCALL_TIMEOUT = {subcall_timeout!r}
+        _RLM_DELIVERABLE_SEED = {seed_deliverables!r}
         # Updated by the parent before each user cell. Tagged onto every
         # broker request so completions / answer-dict captures can be
         # attributed to the cell that originated them.
@@ -419,15 +431,20 @@ def _build_kernel_bootstrap(
         class _RLMAnswerDict(dict):
             def __init__(self):
                 super().__init__()
-                dict.__setitem__(self, "content", "")
+                dict.__setitem__(self, "deliverables", dict(_RLM_DELIVERABLE_SEED))
                 dict.__setitem__(self, "ready", False)
             def __setitem__(self, key, value):
                 dict.__setitem__(self, key, value)
                 if key == "ready" and value:
                     try:
+                        _deliverables = self.get("deliverables") or {{}}
+                        if not isinstance(_deliverables, dict):
+                            _deliverables = {{}}
                         _rlm_request(_RLM_SUBCALL_ADDRESS, {{
                             "type": "answer",
-                            "content": str(self.get("content", "")),
+                            "deliverables": {{
+                                str(_k): str(_v) for _k, _v in _deliverables.items()
+                            }},
                             "cell_id": _RLM_CURRENT_CELL,
                         }})
                     except Exception:
@@ -532,6 +549,7 @@ class IPythonREPL(NonIsolatedEnv):
         startup_timeout: float = 60.0,
         subcall_timeout: float | None = None,
         max_concurrent_subcalls: int = 4,
+        deliverable_slots: list[str] | None = None,
         **kwargs,
     ):
         if kernel_mode not in ("in_process", "subprocess"):
@@ -559,6 +577,7 @@ class IPythonREPL(NonIsolatedEnv):
 
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn
+        self.deliverable_slots = normalize_slots(deliverable_slots)
         self.kernel_mode: KernelMode = kernel_mode
         # Normalize cell_timeout: 0 or negative is meaningless (subprocess
         # mode would interpret it as "give up immediately"). Treat as
@@ -615,9 +634,9 @@ class IPythonREPL(NonIsolatedEnv):
         # ``self.locals``.
         self._subprocess_shadow: dict[str, Any] = {}
 
-        # Tracking state for LLM calls / final answer during execute_code.
+        # Tracking state for LLM calls / final deliverables during execute_code.
         self._pending_llm_calls: list[RLMChatCompletion] = []
-        self._last_final_answer: str | None = None
+        self._last_final_deliverables: dict[str, str] | None = None
 
         # In-process: IPython shell instance
         self._shell: Any = None
@@ -704,7 +723,9 @@ class IPythonREPL(NonIsolatedEnv):
         ns["rlm_query_batched"] = self._rlm_query_batched
         ns["SHOW_VARS"] = self._show_vars
         ns["input"] = self._disabled_input
-        ns["answer"] = _AnswerDict(on_ready=self._capture_answer)
+        ns["answer"] = _AnswerDict(
+            on_ready=self._capture_answer, slots=self.deliverable_slots
+        )
 
         # Inject custom tools
         for name, entry in self.custom_tools.items():
@@ -757,6 +778,7 @@ class IPythonREPL(NonIsolatedEnv):
             subcall_address=self._broker.address,
             depth=self.depth,
             subcall_timeout=self.subcall_timeout,
+            deliverable_slots=self.deliverable_slots,
         )
         result = self._execute_in_kernel(
             bootstrap, timeout=self.startup_timeout, drain_broker=False
@@ -831,9 +853,11 @@ class IPythonREPL(NonIsolatedEnv):
     # Scaffold helpers (in-process only; subprocess has its own in the kernel)
     # -------------------------------------------------------------------------
 
-    def _capture_answer(self, content: Any) -> None:
+    def _capture_answer(self, deliverables: dict[str, str]) -> None:
         """Called by ``_AnswerDict`` when the model sets ``answer["ready"] = True``."""
-        self._last_final_answer = str(content)
+        self._last_final_deliverables = {
+            str(k): str(v) for k, v in (deliverables or {}).items()
+        }
 
     @staticmethod
     def _disabled_input(*_args: Any, **_kwargs: Any) -> str:
@@ -1166,7 +1190,7 @@ class IPythonREPL(NonIsolatedEnv):
             # ``execute_code`` call from another thread would clobber the
             # in-flight cell's bookkeeping.
             self._pending_llm_calls = []
-            self._last_final_answer = None
+            self._last_final_deliverables = None
 
             if use_alarm:
                 prev_handler = signal.signal(signal.SIGALRM, _alarm_handler)
@@ -1225,8 +1249,8 @@ class IPythonREPL(NonIsolatedEnv):
             # Snapshot bookkeeping under the lock too — reading and clearing
             # outside lets a concurrent thread overwrite/wipe the state we're
             # about to report.
-            final_answer = self._last_final_answer
-            self._last_final_answer = None
+            final_deliverables = self._last_final_deliverables
+            self._last_final_deliverables = None
             rlm_calls = self._pending_llm_calls.copy()
 
         return REPLResult(
@@ -1235,7 +1259,7 @@ class IPythonREPL(NonIsolatedEnv):
             locals=locals_snapshot,
             execution_time=time.perf_counter() - start_time,
             rlm_calls=rlm_calls,
-            final_answer=final_answer,
+            final_deliverables=final_deliverables,
         )
 
     def _execute_in_kernel(
@@ -1361,9 +1385,9 @@ class IPythonREPL(NonIsolatedEnv):
         # than attributing them to this cell.
         if drain_broker:
             assert cell_id is not None
-            completions, final_answer = self._broker.drain(cell_id)
+            completions, final_deliverables = self._broker.drain(cell_id)
         else:
-            completions, final_answer = [], None
+            completions, final_deliverables = [], None
 
         return REPLResult(
             stdout="".join(stdout_parts),
@@ -1371,7 +1395,7 @@ class IPythonREPL(NonIsolatedEnv):
             locals={},  # serializing arbitrary user_ns through ZMQ is costly; skip for now
             execution_time=time.perf_counter() - start_time,
             rlm_calls=list(completions),
-            final_answer=final_answer,
+            final_deliverables=final_deliverables,
         )
 
     @staticmethod
@@ -1392,12 +1416,16 @@ class IPythonREPL(NonIsolatedEnv):
         # subsequent ``ready=True`` assignments still trigger capture.
         current = ns.get("answer")
         if not isinstance(current, _AnswerDict):
-            replacement = _AnswerDict(on_ready=self._capture_answer)
+            replacement = _AnswerDict(
+                on_ready=self._capture_answer, slots=self.deliverable_slots
+            )
             if isinstance(current, dict):
                 for k, v in current.items():
                     dict.__setitem__(replacement, k, v)
-                if current.get("ready") and self._last_final_answer is None:
-                    self._last_final_answer = str(current.get("content", ""))
+                if current.get("ready") and self._last_final_deliverables is None:
+                    deliverables = current.get("deliverables") or {}
+                    if isinstance(deliverables, dict):
+                        self._capture_answer(deliverables)
             ns["answer"] = replacement
         if "context_0" in ns:
             ns["context"] = ns["context_0"]

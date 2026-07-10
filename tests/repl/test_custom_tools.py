@@ -188,8 +188,10 @@ class TestLocalREPLCustomTools:
         repl = LocalREPL(custom_tools=custom_tools)
 
         # The ``answer`` dict completion signal should still work alongside tools.
-        result = repl.execute_code('answer["content"] = double(21)\nanswer["ready"] = True')
-        assert result.final_answer == "42"
+        result = repl.execute_code(
+            'answer["deliverables"]["answer"] = double(21)\nanswer["ready"] = True'
+        )
+        assert result.final_deliverables == {"answer": "42"}
 
         # SHOW_VARS should still work (and skip the reserved ``answer`` slot).
         repl.execute_code("my_var = 7")

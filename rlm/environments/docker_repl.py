@@ -34,6 +34,7 @@ from typing import Any
 
 from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
 from rlm.core.types import REPLResult, RLMChatCompletion
+from rlm.environments.local_repl import normalize_slots
 from rlm.environments.base_env import (
     NonIsolatedEnv,
     extract_tool_value,
@@ -261,10 +262,12 @@ def _build_exec_script(
     depth: int = 1,
     custom_tools: dict[str, Any] | None = None,
     compaction: bool = False,
+    deliverable_slots: list[str] | None = None,
 ) -> str:
     """Build the per-cell execution script that runs inside the container."""
     code_b64 = base64.b64encode(code.encode()).decode()
     custom_tools_code = _build_custom_tools_code(custom_tools)
+    seed_deliverables = {name: "" for name in normalize_slots(deliverable_slots)}
     # In compaction mode the running summary list owns `history`; don't let the
     # versioned history_0 alias clobber it (the host re-injects it each turn).
     history_alias = (
@@ -284,6 +287,7 @@ except ImportError:
 PROXY = "http://host.docker.internal:{proxy_port}"
 STATE = "/workspace/state.dill"
 DEPTH = {depth}
+_RLM_DELIVERABLE_SEED = {seed_deliverables!r}
 
 # Generous timeouts: plain LM calls can be slow; recursive RLM calls slower still.
 _LLM_TIMEOUT = 600
@@ -347,7 +351,7 @@ _locals = load_state()
 
 # Default answer dict on the first invocation; preserved across calls via state.
 if "answer" not in _locals or not isinstance(_locals.get("answer"), dict):
-    _locals["answer"] = {{"content": "", "ready": False}}
+    _locals["answer"] = {{"deliverables": dict(_RLM_DELIVERABLE_SEED), "ready": False}}
 
 def SHOW_VARS():
     available = {{k: type(v).__name__ for k, v in _locals.items() if not k.startswith("_") and k != "answer"}}
@@ -394,12 +398,15 @@ save_state(_locals)
 _ans = _locals.get("answer") if isinstance(_locals.get("answer"), dict) else None
 _final = None
 if _ans is not None and _ans.get("ready"):
-    _final = str(_ans.get("content", ""))
+    _deliv = _ans.get("deliverables")
+    if not isinstance(_deliv, dict):
+        _deliv = {{}}
+    _final = {{str(_k): str(_v) for _k, _v in _deliv.items()}}
 print(json.dumps({{
     "stdout": stdout_buf.getvalue(),
     "stderr": stderr_buf.getvalue(),
     "locals": {{k: repr(v) for k, v in _locals.items() if not k.startswith("_")}},
-    "final_answer": _final,
+    "final_deliverables": _final,
 }}, ensure_ascii=False))
 '''
     )
@@ -435,6 +442,7 @@ class DockerREPL(NonIsolatedEnv):
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
         max_concurrent_subcalls: int = 4,
+        deliverable_slots: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -444,6 +452,7 @@ class DockerREPL(NonIsolatedEnv):
             **kwargs,
         )
 
+        self.deliverable_slots = normalize_slots(deliverable_slots)
         self.image = image
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn
@@ -583,7 +592,8 @@ class DockerREPL(NonIsolatedEnv):
         self.lm_handler_address = address
         if self.proxy_server is not None:
             self.proxy_server.lm_handler_address = address
-        self.execute_code("answer = {'content': '', 'ready': False}")
+        seed = {name: "" for name in self.deliverable_slots}
+        self.execute_code(f"answer = {{'deliverables': {seed!r}, 'ready': False}}")
 
     def add_context(
         self, context_payload: dict | list | str, context_index: int | None = None
@@ -692,6 +702,7 @@ class DockerREPL(NonIsolatedEnv):
             self.depth,
             custom_tools=self.custom_tools,
             compaction=self.compaction,
+            deliverable_slots=self.deliverable_slots,
         )
         script_path = os.path.join(self.temp_dir, "_exec.py")
         with open(script_path, "w") as f:
@@ -716,7 +727,7 @@ class DockerREPL(NonIsolatedEnv):
                 locals=data.get("locals", {}),
                 execution_time=time.perf_counter() - start,
                 rlm_calls=calls,
-                final_answer=data.get("final_answer"),
+                final_deliverables=data.get("final_deliverables"),
             )
         except json.JSONDecodeError:
             return REPLResult(

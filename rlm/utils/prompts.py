@@ -17,7 +17,7 @@ The REPL environment is initialized with:
 5. A `rlm_query_batched(prompts, model=None)` function that spawns multiple recursive RLM sub-calls. Each prompt gets its own child RLM. Falls back to `llm_query_batched` if recursion is not available.
 6. A `SHOW_VARS()` function that returns all variables you have created in the REPL. Use this to check what variables exist.
 7. The ability to use `print()` statements to view the output of your REPL code and continue your reasoning.
-8. An `answer` dict (`{{"content": "", "ready": False}}`) that you use to submit your final answer. See "Submitting your final answer" below.
+8. An `answer` dict (`{{"deliverables": {{...}}, "ready": False}}`) that you use to submit your final answer. See "Submitting your final answer" below.
 {custom_tools_section}
 
 **When to use `llm_query` vs `rlm_query`:**
@@ -102,12 +102,12 @@ if "USE_LEMMA" in r.upper():
     summary = rlm_query("Prove 'n^2 even => n even' then use it to show sqrt 2 irrational. Two sentences.")
 
 Submitting your final answer:
-The REPL exposes an `answer` dict, initialized to `{{"content": "", "ready": False}}`. When (and only when) you are done with the task, submit your final answer from inside a ```repl``` block:
+The REPL exposes an `answer` dict, initialized to `{{"deliverables": {{...}}, "ready": False}}` where `answer["deliverables"]` is pre-seeded with one empty slot per required deliverable (keyed by exact filename). When (and only when) you are done with the task, submit your final answer from inside a ```repl``` block:
 ```repl
-answer["content"] = "your final answer here"
+answer["deliverables"]["<filename>"] = "the complete deliverable text here"
 answer["ready"] = True
 ```
-`answer["content"]` must hold the final answer text (it can be a string, number, or anything `str()`-able). The run terminates as soon as `answer["ready"]` is set to True, and the value of `answer["content"]` is returned to the user. Do NOT set `answer["ready"] = True` until you have actually completed the task. You can update `answer["content"]` across multiple steps before flipping `ready` to True.
+Each slot must hold that deliverable's complete text. The run terminates as soon as `answer["ready"]` is set to True, and the deliverables are returned to the user. Do NOT set `answer["ready"] = True` until you have actually completed the task. You can update the slots across multiple steps before flipping `ready` to True.
 
 If you're unsure what variables exist, you can call SHOW_VARS() in a repl block to see all available variables.
 
@@ -132,7 +132,7 @@ To use the REPL, you need to write code in ```repl``` blocks; the REPL persists 
 - `llm_query_batched(prompts: list[str], model=None) -> list[str]`: concurrently call several LLM calls in parallel over a list of prompts; same order out as in.
 - `rlm_query(prompt, model=None)` / `rlm_query_batched(prompts, model=None)`: recursive RLM sub-calls. Fall back to `llm_query` / `llm_query_batched` when recursion is disabled.
 - `SHOW_VARS() -> str`: list every variable currently in the REPL.
-- `answer`: dict initialized to `{{"content": "", "ready": False}}`. To submit, set `answer["content"]` to the final answer and `answer["ready"] = True` inside a ```repl``` block.
+- `answer`: dict initialized to `{{"deliverables": {{...}}, "ready": False}}`. `answer["deliverables"]` is pre-seeded with one empty slot per required deliverable, keyed by its exact filename. To submit, write each deliverable's COMPLETE text into its slot (`answer["deliverables"]["<filename>"] = ...`) and then set `answer["ready"] = True` inside a ```repl``` block. Do not add or rename slots; fill the ones provided.
 {custom_tools_section}
 
 REPL outputs over ~20K characters are truncated, so for longer payloads slice `context` and pass slices through `llm_query` rather than `print`-ing them whole. The REPL is NOT a Jupyter cell — only `print(...)` output (stdout) is shown back to you between turns; a bare expression on the last line is silently discarded. Always wrap inspections in `print(...)`.

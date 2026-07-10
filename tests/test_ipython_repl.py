@@ -124,24 +124,39 @@ def test_in_process_exposes_locals_dict():
 
 
 @BOTH_MODES
-def test_answer_ready_surfaces_final_answer(kernel_mode: str):
+def test_answer_ready_surfaces_final_deliverables(kernel_mode: str):
     with IPythonREPL(kernel_mode=kernel_mode) as repl:
-        result = repl.execute_code('answer["content"] = "forty-two"\nanswer["ready"] = True')
-    assert result.final_answer == "forty-two"
+        result = repl.execute_code(
+            'answer["deliverables"]["answer"] = "forty-two"\nanswer["ready"] = True'
+        )
+    assert result.final_deliverables == {"answer": "forty-two"}
 
 
 @BOTH_MODES
 def test_answer_not_ready_returns_none(kernel_mode: str):
     with IPythonREPL(kernel_mode=kernel_mode) as repl:
-        result = repl.execute_code('answer["content"] = "wip"')
-    assert result.final_answer is None
+        result = repl.execute_code('answer["deliverables"]["answer"] = "wip"')
+    assert result.final_deliverables is None
 
 
 @BOTH_MODES
 def test_answer_content_is_stringified(kernel_mode: str):
     with IPythonREPL(kernel_mode=kernel_mode) as repl:
-        result = repl.execute_code('answer["content"] = 123\nanswer["ready"] = True')
-    assert result.final_answer == "123"
+        result = repl.execute_code(
+            'answer["deliverables"]["answer"] = 123\nanswer["ready"] = True'
+        )
+    assert result.final_deliverables == {"answer": "123"}
+
+
+@BOTH_MODES
+def test_answer_multi_deliverable_slots(kernel_mode: str):
+    with IPythonREPL(kernel_mode=kernel_mode, deliverable_slots=["a.md", "b.md"]) as repl:
+        result = repl.execute_code(
+            'answer["deliverables"]["a.md"] = "AAA"\n'
+            'answer["deliverables"]["b.md"] = "BBB"\n'
+            'answer["ready"] = True'
+        )
+    assert result.final_deliverables == {"a.md": "AAA", "b.md": "BBB"}
 
 
 # -----------------------------------------------------------------------------
@@ -692,11 +707,12 @@ def test_stale_final_answer_not_misattributed_to_next_cell():
         cell_timeout=0.1,
     ) as repl:
         r1 = repl.execute_code(
-            'rlm_query("p")\nanswer["content"] = "late-A"\nanswer["ready"] = True'
+            'rlm_query("p")\nanswer["deliverables"]["answer"] = "late-A"\n'
+            'answer["ready"] = True'
         )
         assert "TimeoutError" in r1.stderr
         # Cell A is over with no final answer captured.
-        assert r1.final_answer is None
+        assert r1.final_deliverables is None
 
         # Now release subcall_fn and let it complete. If cell A's
         # answer were globally stored (by old code), it would now be
@@ -707,8 +723,8 @@ def test_stale_final_answer_not_misattributed_to_next_cell():
         repl.cell_timeout = 5.0
         r2 = repl.execute_code("print('clean')")
 
-    assert r2.final_answer is None, (
-        f"cell B must not inherit cell A's stale final answer; got {r2.final_answer!r}"
+    assert r2.final_deliverables is None, (
+        f"cell B must not inherit cell A's stale final answer; got {r2.final_deliverables!r}"
     )
 
 

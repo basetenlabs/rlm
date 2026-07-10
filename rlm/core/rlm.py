@@ -6,6 +6,7 @@ from typing import Any
 from rlm.clients import BaseLM, get_client
 from rlm.core.lm_handler import LMHandler
 from rlm.core.types import (
+    DEFAULT_DELIVERABLE_SLOT,
     ClientBackend,
     CodeBlock,
     EnvironmentType,
@@ -14,6 +15,7 @@ from rlm.core.types import (
     RLMIteration,
     RLMMetadata,
     UsageSummary,
+    render_deliverables,
 )
 from rlm.environments import BaseEnv, SupportsPersistence, get_environment
 from rlm.logger import RLMLogger, VerbosePrinter
@@ -99,6 +101,7 @@ class RLM:
         user_prologue: str | None = None,
         repl_output_cap: int = 20000,
         nudge_on_no_code: bool = True,
+        deliverable_slots: list[str] | None = None,
     ):
         """
         Args:
@@ -216,6 +219,9 @@ class RLM:
         # no corrective signal and can pattern-lock it (GLM-5.2 thinking-off
         # perseveration, 2026-07-09 probe). Set False to reproduce old behavior.
         self.nudge_on_no_code = nudge_on_no_code
+        # Pre-seed ``answer["deliverables"]`` with one empty slot per expected
+        # deliverable filename. None/empty -> a single generic "answer" slot.
+        self.deliverable_slots = deliverable_slots
         self.logger = logger
         self.verbose = VerbosePrinter(enabled=verbose)
 
@@ -323,6 +329,9 @@ class RLM:
             if self.compaction and self.environment_type in ("local", "docker"):
                 env_kwargs["compaction"] = True
             env_kwargs["max_concurrent_subcalls"] = self.max_concurrent_subcalls
+            # Seed the answer-dict slots so the env pre-populates
+            # answer["deliverables"] with one slot per expected deliverable.
+            env_kwargs["deliverable_slots"] = self.deliverable_slots
             environment: BaseEnv = get_environment(self.environment_type, env_kwargs)
 
             if self.persistent:
@@ -450,13 +459,18 @@ class RLM:
                     self._check_iteration_limits(iteration, i, lm_handler)
 
                     # The REPL signals completion by populating
-                    # ``answer["content"]`` and setting ``answer["ready"] = True``.
-                    # Each environment surfaces that on ``REPLResult.final_answer``.
-                    final_answer = None
+                    # ``answer["deliverables"]`` and setting ``answer["ready"] = True``.
+                    # Each environment surfaces that on ``REPLResult.final_deliverables``.
+                    final_deliverables = None
                     for block in iteration.code_blocks:
-                        if getattr(block.result, "final_answer", None) is not None:
-                            final_answer = block.result.final_answer
+                        if getattr(block.result, "final_deliverables", None) is not None:
+                            final_deliverables = block.result.final_deliverables
                             break
+                    final_answer = (
+                        render_deliverables(final_deliverables)
+                        if final_deliverables is not None
+                        else None
+                    )
                     iteration.final_answer = final_answer
 
                     # Store as best partial answer (most recent response with content)
@@ -470,8 +484,11 @@ class RLM:
                     # Verbose output for this iteration
                     self.verbose.print_iteration(iteration, i + 1)
 
-                    if final_answer is not None:
-                        final_answer = self._recover_if_stub(final_answer, environment)
+                    if final_deliverables is not None:
+                        final_deliverables = self._recover_if_stub(
+                            final_deliverables, environment
+                        )
+                        final_answer = render_deliverables(final_deliverables)
                         time_end = time.perf_counter()
                         usage = lm_handler.get_usage_summary()
                         self.verbose.print_final_answer(final_answer)
@@ -487,6 +504,7 @@ class RLM:
                             else "unknown",
                             prompt=prompt,
                             response=final_answer,
+                            deliverables=final_deliverables,
                             usage_summary=usage,
                             execution_time=time_end - time_start,
                             metadata=self.logger.get_trajectory() if self.logger else None,
@@ -511,10 +529,16 @@ class RLM:
                     message="Execution cancelled by user (Ctrl+C)",
                 ) from None
 
-            # Default behavior: we run out of iterations, provide one final answer
+            # Default behavior: we run out of iterations, provide one final answer.
+            # The model never populated the deliverable slots, so fold the
+            # generated fallback into a single slot (all slots get the same text
+            # when there are several) and run stub-recovery per slot.
             time_end = time.perf_counter()
-            final_answer = self._default_answer(message_history, lm_handler)
-            final_answer = self._recover_if_stub(final_answer, environment)
+            fallback = self._default_answer(message_history, lm_handler)
+            slots = self._resolve_slots(environment)
+            final_deliverables = {name: fallback for name in slots}
+            final_deliverables = self._recover_if_stub(final_deliverables, environment)
+            final_answer = render_deliverables(final_deliverables)
             usage = lm_handler.get_usage_summary()
             self.verbose.print_final_answer(final_answer)
             self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
@@ -529,34 +553,60 @@ class RLM:
                 else "unknown",
                 prompt=prompt,
                 response=final_answer,
+                deliverables=final_deliverables,
                 usage_summary=usage,
                 execution_time=time_end - time_start,
                 metadata=self.logger.get_trajectory() if self.logger else None,
             )
 
-    def _recover_if_stub(self, answer: str | None, environment) -> str | None:
-        """Safety net for finalize-protocol non-compliance.
+    def _resolve_slots(self, environment) -> list[str]:
+        """Deliverable slot names, preferring the env's seeded slots."""
+        slots = getattr(environment, "deliverable_slots", None)
+        if slots:
+            return list(slots)
+        if self.deliverable_slots:
+            return list(self.deliverable_slots)
+        return [DEFAULT_DELIVERABLE_SLOT]
+
+    def _recover_if_stub(
+        self, deliverables: dict[str, str] | None, environment
+    ) -> dict[str, str] | None:
+        """Safety net for finalize-protocol non-compliance, applied per slot.
 
         Some models (e.g. DeepSeek V4 Pro) build the full deliverable in a REPL
-        variable but then set ``answer["content"]`` to a short confirmation
-        ("the report has been saved to ..."), producing a stub. When the final
-        answer is suspiciously short, recover the largest report-like string
-        from the REPL namespace (``environment.locals``) instead. Model- and
+        variable but then set the slot to a short confirmation ("the report has
+        been saved to ..."), producing a stub. When a slot's text is
+        suspiciously short, recover the largest report-like string from the REPL
+        namespace (``environment.locals``) instead. Model- and
         variable-name-agnostic: scans all user string variables.
+
+        NOTE: with multiple stubbed slots this recovers the *same* largest
+        variable into each — there is no reliable way to map a REPL variable
+        back to a specific deliverable filename. In practice recovery only fires
+        for single-deliverable stubs; multi-deliverable runs that finalize
+        properly never enter this path.
         """
-        text = answer or ""
-        if len(text) >= 5000:
-            return answer
+        if not deliverables:
+            return deliverables
         locals_ = getattr(environment, "locals", None)
+        return {
+            name: self._recover_slot(text, locals_) for name, text in deliverables.items()
+        }
+
+    @staticmethod
+    def _recover_slot(text: str | None, locals_) -> str:
+        text = text or ""
+        if len(text) >= 5000:
+            return text
         if not isinstance(locals_, dict):
-            return answer
+            return text
         best = text
         for key, val in locals_.items():
             if key in ("answer", "context", "history") or key.startswith("_"):
                 continue
             if isinstance(val, str) and len(val) > len(best) and ("#" in val or len(val) > 5000):
                 best = val
-        return best if len(best) > len(text) else answer
+        return best
 
     def _check_timeout(self, iteration: int, time_start: float) -> None:
         """Raise TimeoutExceededError if the timeout has been exceeded."""

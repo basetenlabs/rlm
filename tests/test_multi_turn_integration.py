@@ -32,7 +32,7 @@ def create_mock_lm(responses: list[str]) -> Mock:
 
 def final(content: str) -> str:
     """Render a model response that submits ``content`` as the final answer."""
-    return f"```repl\nanswer['content'] = {content!r}\nanswer['ready'] = True\n```"
+    return f"```repl\nanswer['deliverables']['answer'] = {content!r}\nanswer['ready'] = True\n```"
 
 
 class TestMultiTurnPersistentEnvironment:

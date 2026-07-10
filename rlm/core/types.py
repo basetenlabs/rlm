@@ -114,6 +114,23 @@ class UsageSummary:
 ########################################################
 ########   Types for REPL and RLM Iterations   #########
 ########################################################
+DEFAULT_DELIVERABLE_SLOT = "answer"
+
+
+def render_deliverables(deliverables: dict[str, str] | None) -> str:
+    """Concatenate per-deliverable slots into a single string for trace/logging.
+
+    Multi-slot output is rendered as ``===== <name> =====\\n<text>`` sections;
+    a single slot renders as just its text (so the common single-deliverable
+    case reads exactly like the old ``content``).
+    """
+    if not deliverables:
+        return ""
+    if len(deliverables) == 1:
+        return next(iter(deliverables.values()))
+    return "\n\n".join(f"===== {name} =====\n{text}" for name, text in deliverables.items())
+
+
 @dataclass
 class RLMChatCompletion:
     """Record of a single LLM call made from within the environment."""
@@ -123,6 +140,10 @@ class RLMChatCompletion:
     response: str
     usage_summary: UsageSummary
     execution_time: float
+    # Per-deliverable final output, keyed by exact deliverable filename. Set on
+    # the completion that finalizes the RLM loop; ``response`` is a rendered
+    # concatenation of these slots (trace/logging only).
+    deliverables: dict[str, str] | None = None
     metadata: dict | None = (
         None  # Full trajectory (run_metadata + iterations) when logger captures it
     )
@@ -138,6 +159,8 @@ class RLMChatCompletion:
             "usage_summary": self.usage_summary.to_dict(),
             "execution_time": self.execution_time,
         }
+        if self.deliverables is not None:
+            out["deliverables"] = self.deliverables
         if self.metadata is not None:
             out["metadata"] = self.metadata
         if self.error is not None:
@@ -152,6 +175,7 @@ class RLMChatCompletion:
             response=data.get("response"),
             usage_summary=UsageSummary.from_dict(data.get("usage_summary")),
             execution_time=data.get("execution_time"),
+            deliverables=data.get("deliverables"),
             metadata=data.get("metadata"),
             error=data.get("error"),
         )
@@ -164,7 +188,10 @@ class REPLResult:
     locals: dict
     execution_time: float
     llm_calls: list["RLMChatCompletion"]
-    final_answer: str | None = None
+    # Per-deliverable final output captured when the model set
+    # ``answer["ready"] = True``. Keys are the exact deliverable filenames
+    # (or the single ``"answer"`` slot for generic use). None until finalized.
+    final_deliverables: dict[str, str] | None = None
 
     def __init__(
         self,
@@ -173,14 +200,14 @@ class REPLResult:
         locals: dict,
         execution_time: float = None,
         rlm_calls: list["RLMChatCompletion"] = None,
-        final_answer: str | None = None,
+        final_deliverables: dict[str, str] | None = None,
     ):
         self.stdout = stdout
         self.stderr = stderr
         self.locals = locals
         self.execution_time = execution_time
         self.rlm_calls = rlm_calls or []
-        self.final_answer = final_answer
+        self.final_deliverables = final_deliverables
 
     def __str__(self):
         return f"REPLResult(stdout={self.stdout}, stderr={self.stderr}, locals={self.locals}, execution_time={self.execution_time}, rlm_calls={len(self.rlm_calls)})"
@@ -192,7 +219,7 @@ class REPLResult:
             "locals": {k: _serialize_value(v) for k, v in self.locals.items()},
             "execution_time": self.execution_time,
             "rlm_calls": [call.to_dict() for call in self.rlm_calls],
-            "final_answer": self.final_answer,
+            "final_deliverables": self.final_deliverables,
         }
 
 

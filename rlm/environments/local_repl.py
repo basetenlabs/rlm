@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
-from rlm.core.types import REPLResult, RLMChatCompletion
+from rlm.core.types import DEFAULT_DELIVERABLE_SLOT, REPLResult, RLMChatCompletion
 from rlm.environments.base_env import (
     RESERVED_TOOL_NAMES,
     NonIsolatedEnv,
@@ -23,18 +23,36 @@ from rlm.environments.base_env import (
 )
 
 
+def normalize_slots(slots: list[str] | None) -> list[str]:
+    """Slot names to pre-seed ``answer["deliverables"]`` with.
+
+    None/empty falls back to a single generic ``"answer"`` slot so the engine
+    works for non-b10 use. Order and duplicates are preserved-then-deduped.
+    """
+    if not slots:
+        return [DEFAULT_DELIVERABLE_SLOT]
+    seen: list[str] = []
+    for s in slots:
+        if s not in seen:
+            seen.append(s)
+    return seen or [DEFAULT_DELIVERABLE_SLOT]
+
+
 class _AnswerDict(dict):
     """REPL-visible dict where ``answer["ready"] = True`` signals completion.
 
-    Behaves exactly like ``dict`` for the model, but invokes ``on_ready`` the
-    first time ``ready`` flips truthy. The callback receives the current
-    ``content``, lets the env capture it (in-process attr, broker push, etc.),
-    and the next ``execute_code`` will surface it as ``REPLResult.final_answer``.
+    The model writes each deliverable's full text into
+    ``answer["deliverables"]["<filename>"]`` (slots pre-seeded from the caller's
+    expected deliverable names, or a single ``"answer"`` slot by default), then
+    sets ``answer["ready"] = True``. The first time ``ready`` flips truthy the
+    dict invokes ``on_ready`` with the whole ``deliverables`` dict so the env
+    can capture it; the next ``execute_code`` surfaces it as
+    ``REPLResult.final_deliverables``.
     """
 
-    def __init__(self, on_ready=None):
+    def __init__(self, on_ready=None, slots: list[str] | None = None):
         super().__init__()
-        super().__setitem__("content", "")
+        super().__setitem__("deliverables", {name: "" for name in normalize_slots(slots)})
         super().__setitem__("ready", False)
         self._on_ready = on_ready
 
@@ -42,7 +60,8 @@ class _AnswerDict(dict):
         super().__setitem__(key, value)
         if key == "ready" and value and self._on_ready is not None:
             try:
-                self._on_ready(self.get("content", ""))
+                deliverables = self.get("deliverables") or {}
+                self._on_ready(dict(deliverables) if isinstance(deliverables, dict) else {})
             except Exception:
                 pass
 
@@ -162,6 +181,7 @@ class LocalREPL(NonIsolatedEnv):
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
         max_concurrent_subcalls: int = 4,
+        deliverable_slots: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -171,6 +191,9 @@ class LocalREPL(NonIsolatedEnv):
             **kwargs,
         )
 
+        # Slot names for ``answer["deliverables"]`` (exact deliverable filenames,
+        # or a single "answer" slot by default).
+        self.deliverable_slots = normalize_slots(deliverable_slots)
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn  # Callback for recursive RLM calls (depth > 1 support)
         self.original_cwd = os.getcwd()
@@ -217,7 +240,7 @@ class LocalREPL(NonIsolatedEnv):
         # Track LLM calls made during code execution
         self._pending_llm_calls: list[RLMChatCompletion] = []
         # Captured the first time the model sets ``answer["ready"] = True``.
-        self._last_final_answer: str | None = None
+        self._last_final_deliverables: dict[str, str] | None = None
 
         # Add helper functions
         self.globals["SHOW_VARS"] = self._show_vars
@@ -227,9 +250,11 @@ class LocalREPL(NonIsolatedEnv):
         self.globals["rlm_query_batched"] = self._rlm_query_batched
 
         # The model marks completion via ``answer["ready"] = True``; the
-        # custom dict captures the content as soon as that happens so we
-        # don't have to probe the namespace after every cell.
-        self.locals["answer"] = _AnswerDict(on_ready=self._capture_answer)
+        # custom dict captures the deliverables dict as soon as that happens so
+        # we don't have to probe the namespace after every cell.
+        self.locals["answer"] = _AnswerDict(
+            on_ready=self._capture_answer, slots=self.deliverable_slots
+        )
 
         # Add custom tools to globals
         # Tools can be either plain values or (value, description) tuples
@@ -241,8 +266,10 @@ class LocalREPL(NonIsolatedEnv):
                 # For non-callable values (constants, data), add to locals
                 self.locals[name] = value
 
-    def _capture_answer(self, content: Any) -> None:
-        self._last_final_answer = str(content)
+    def _capture_answer(self, deliverables: dict[str, str]) -> None:
+        self._last_final_deliverables = {
+            str(k): str(v) for k, v in (deliverables or {}).items()
+        }
 
     def _show_vars(self) -> str:
         """Show all available variables in the REPL environment."""
@@ -527,15 +554,19 @@ class LocalREPL(NonIsolatedEnv):
             elif name == "answer":
                 current = self.locals.get("answer")
                 # If the model rebound ``answer`` to a plain dict, the
-                # _AnswerDict callback never fired; capture content here if
+                # _AnswerDict callback never fired; capture deliverables here if
                 # ``ready=True``, then re-wrap so the next cell signals.
                 if not isinstance(current, _AnswerDict):
-                    replacement = _AnswerDict(on_ready=self._capture_answer)
+                    replacement = _AnswerDict(
+                        on_ready=self._capture_answer, slots=self.deliverable_slots
+                    )
                     if isinstance(current, dict):
                         for k, v in current.items():
                             dict.__setitem__(replacement, k, v)
-                        if current.get("ready") and self._last_final_answer is None:
-                            self._last_final_answer = str(current.get("content", ""))
+                        if current.get("ready") and self._last_final_deliverables is None:
+                            deliverables = current.get("deliverables") or {}
+                            if isinstance(deliverables, dict):
+                                self._capture_answer(deliverables)
                     self.locals["answer"] = replacement
             elif name == "context" and "context_0" in self.locals:
                 self.locals["context"] = self.locals["context_0"]
@@ -570,8 +601,8 @@ class LocalREPL(NonIsolatedEnv):
                 stdout = stdout_buf.getvalue()
                 stderr = stderr_buf.getvalue() + f"\n{type(e).__name__}: {e}"
 
-        final_answer = self._last_final_answer
-        self._last_final_answer = None
+        final_deliverables = self._last_final_deliverables
+        self._last_final_deliverables = None
 
         return REPLResult(
             stdout=stdout,
@@ -579,7 +610,7 @@ class LocalREPL(NonIsolatedEnv):
             locals=self.locals.copy(),
             execution_time=time.perf_counter() - start_time,
             rlm_calls=self._pending_llm_calls.copy(),
-            final_answer=final_answer,
+            final_deliverables=final_deliverables,
         )
 
     def __enter__(self):

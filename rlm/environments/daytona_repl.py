@@ -24,6 +24,7 @@ from daytona import (
 
 from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
 from rlm.core.types import REPLResult, RLMChatCompletion
+from rlm.environments.local_repl import normalize_slots
 from rlm.environments.base_env import IsolatedEnv, extract_tool_value, validate_custom_tools
 
 # =============================================================================
@@ -158,6 +159,7 @@ def _build_exec_script(
     broker_port: int = 8080,
     depth: int = 1,
     custom_tools: dict[str, Any] | None = None,
+    deliverable_slots: list[str] | None = None,
 ) -> str:
     """
     Build a script that executes code with state persistence.
@@ -172,6 +174,7 @@ def _build_exec_script(
             - Other values: JSON-serialized and loaded as data
     """
     code_b64 = base64.b64encode(code.encode()).decode()
+    seed_deliverables = {name: "" for name in normalize_slots(deliverable_slots)}
 
     # Build custom tools injection code
     custom_tools_code = ""
@@ -222,6 +225,7 @@ except ImportError:
 # =============================================================================
 
 BROKER_URL = "http://127.0.0.1:{broker_port}"
+_RLM_DELIVERABLE_SEED = {seed_deliverables!r}
 
 def llm_query(prompt, model=None):
     """Query the LM via the broker."""
@@ -301,7 +305,7 @@ def serialize_locals(state):
 _locals = load_state()
 
 if "answer" not in _locals or not isinstance(_locals.get("answer"), dict):
-    _locals["answer"] = {{"content": "", "ready": False}}
+    _locals["answer"] = {{"deliverables": dict(_RLM_DELIVERABLE_SEED), "ready": False}}
 
 def SHOW_VARS():
     available = {{k: type(v).__name__ for k, v in _locals.items() if not k.startswith("_") and k != "answer"}}
@@ -351,12 +355,17 @@ if "history_0" in _locals:
 save_state(_locals)
 
 _ans = _locals.get("answer") if isinstance(_locals.get("answer"), dict) else None
-_final = str(_ans.get("content", "")) if (_ans is not None and _ans.get("ready")) else None
+_final = None
+if _ans is not None and _ans.get("ready"):
+    _deliv = _ans.get("deliverables")
+    if not isinstance(_deliv, dict):
+        _deliv = {{}}
+    _final = {{str(_k): str(_v) for _k, _v in _deliv.items()}}
 result = {{
     "stdout": stdout_buf.getvalue(),
     "stderr": stderr_buf.getvalue(),
     "locals": serialize_locals(_locals),
-    "final_answer": _final,
+    "final_deliverables": _final,
 }}
 print(json.dumps(result))
 '''
@@ -393,6 +402,7 @@ class DaytonaREPL(IsolatedEnv):
         depth: int = 1,
         custom_tools: dict[str, Any] | None = None,
         custom_sub_tools: dict[str, Any] | None = None,
+        deliverable_slots: list[str] | None = None,
         **kwargs,
     ):
         """
@@ -425,6 +435,7 @@ class DaytonaREPL(IsolatedEnv):
             )
         super().__init__(persistent=persistent, depth=depth, **kwargs)
 
+        self.deliverable_slots = normalize_slots(deliverable_slots)
         self.api_key = api_key or os.getenv("DAYTONA_API_KEY")
         self.target = target
         self.name = name
@@ -625,7 +636,11 @@ class DaytonaREPL(IsolatedEnv):
 
         # Build and execute the script
         script = _build_exec_script(
-            code, self.BROKER_PORT, self.depth, custom_tools=self.custom_tools
+            code,
+            self.BROKER_PORT,
+            self.depth,
+            custom_tools=self.custom_tools,
+            deliverable_slots=self.deliverable_slots,
         )
 
         # Upload the script as a temporary file
@@ -661,7 +676,7 @@ class DaytonaREPL(IsolatedEnv):
                 locals=result.get("locals", {}),
                 execution_time=execution_time,
                 rlm_calls=pending_calls,
-                final_answer=result.get("final_answer"),
+                final_deliverables=result.get("final_deliverables"),
             )
         except json.JSONDecodeError:
             return REPLResult(

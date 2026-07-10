@@ -93,23 +93,25 @@ print(result)
 
 
 class TestAnswerDictFinalAnswer:
-    """Tests for the ``answer`` dict completion signal surfaced via REPLResult.final_answer."""
+    """Tests for the ``answer`` dict completion signal surfaced via REPLResult.final_deliverables."""
 
-    def test_answer_dict_ready_true_sets_final_answer(self):
-        """Setting ``answer['ready'] = True`` must populate REPLResult.final_answer."""
+    def test_answer_dict_ready_true_sets_final_deliverables(self):
+        """Setting ``answer['ready'] = True`` must populate REPLResult.final_deliverables."""
         env = LocalREPL()
         try:
-            result = env.execute_code('answer["content"] = "the result"\nanswer["ready"] = True')
-            assert result.final_answer == "the result"
+            result = env.execute_code(
+                'answer["deliverables"]["answer"] = "the result"\nanswer["ready"] = True'
+            )
+            assert result.final_deliverables == {"answer": "the result"}
         finally:
             env.cleanup()
 
-    def test_answer_dict_unset_keeps_final_answer_none(self):
+    def test_answer_dict_unset_keeps_final_deliverables_none(self):
         """If ``ready`` stays False, the REPL must not surface a final answer."""
         env = LocalREPL()
         try:
-            result = env.execute_code('answer["content"] = "wip"')
-            assert result.final_answer is None
+            result = env.execute_code('answer["deliverables"]["answer"] = "wip"')
+            assert result.final_deliverables is None
         finally:
             env.cleanup()
 
@@ -117,17 +119,21 @@ class TestAnswerDictFinalAnswer:
         """Plain-dict rebind with ``ready=True`` must still be captured."""
         env = LocalREPL()
         try:
-            result = env.execute_code('answer = {"content": "rebound", "ready": True}')
-            assert result.final_answer == "rebound"
+            result = env.execute_code(
+                'answer = {"deliverables": {"answer": "rebound"}, "ready": True}'
+            )
+            assert result.final_deliverables == {"answer": "rebound"}
         finally:
             env.cleanup()
 
     def test_answer_content_can_be_non_string(self):
-        """Any ``str()``-able content (numbers, lists) should be coerced to a string final answer."""
+        """Any ``str()``-able slot value (numbers, lists) is coerced to a string."""
         env = LocalREPL()
         try:
-            result = env.execute_code('answer["content"] = [1, 2, 3]\nanswer["ready"] = True')
-            assert result.final_answer == "[1, 2, 3]"
+            result = env.execute_code(
+                'answer["deliverables"]["answer"] = [1, 2, 3]\nanswer["ready"] = True'
+            )
+            assert result.final_deliverables == {"answer": "[1, 2, 3]"}
         finally:
             env.cleanup()
 
