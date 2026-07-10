@@ -127,47 +127,66 @@ class TestLocalREPLHelpers:
     """Tests for helper functions and the answer-dict completion signal."""
 
     def test_answer_dict_defaults(self):
-        """The ``answer`` dict starts unready with an empty default slot."""
+        """The default (content-mode) ``answer`` dict starts unready with empty content."""
         repl = LocalREPL()
-        assert repl.locals["answer"]["deliverables"] == {"answer": ""}
+        assert repl.locals["answer"]["content"] == ""
+        assert "deliverables" not in repl.locals["answer"]
         assert repl.locals["answer"]["ready"] is False
         repl.cleanup()
 
-    def test_answer_ready_surfaces_final_deliverables(self):
-        """Setting ``answer['ready'] = True`` surfaces the slot dict on final_deliverables."""
+    def test_answer_ready_surfaces_final_answer(self):
+        """Setting ``answer['ready'] = True`` surfaces ``content`` on final_answer.
+
+        Content mode also leaves ``final_deliverables`` unset (None).
+        """
         repl = LocalREPL()
-        result = repl.execute_code(
-            'answer["deliverables"]["answer"] = "the result"\nanswer["ready"] = True'
-        )
-        assert result.final_deliverables == {"answer": "the result"}
+        result = repl.execute_code('answer["content"] = "the result"\nanswer["ready"] = True')
+        assert result.final_answer == "the result"
+        assert result.final_deliverables is None
         repl.cleanup()
 
     def test_answer_ready_false_does_not_surface(self):
-        """Mutating a slot without flipping ``ready`` must not end the run."""
+        """Mutating ``content`` without flipping ``ready`` must not end the run."""
         repl = LocalREPL()
-        result = repl.execute_code('answer["deliverables"]["answer"] = "still working"')
-        assert result.final_deliverables is None
+        result = repl.execute_code('answer["content"] = "still working"')
+        assert result.final_answer is None
         repl.cleanup()
 
     def test_answer_rebind_to_plain_dict(self):
         """Rebinding ``answer`` to a plain dict with ready=True is still picked up."""
         repl = LocalREPL()
-        result = repl.execute_code(
-            'answer = {"deliverables": {"answer": "rebound"}, "ready": True}'
-        )
-        assert result.final_deliverables == {"answer": "rebound"}
+        result = repl.execute_code('answer = {"content": "rebound", "ready": True}')
+        assert result.final_answer == "rebound"
+        repl.cleanup()
+
+    def test_slot_mode_defaults(self):
+        """With deliverable_slots the ``answer`` dict seeds per-file slots (no content)."""
+        repl = LocalREPL(deliverable_slots=["a.md", "b.md"])
+        assert repl.locals["answer"]["deliverables"] == {"a.md": "", "b.md": ""}
+        assert "content" not in repl.locals["answer"]
+        assert repl.locals["answer"]["ready"] is False
         repl.cleanup()
 
     def test_multi_deliverable_slots(self):
-        """Slots seeded from deliverable_slots surface per-file text."""
+        """Slots seeded from deliverable_slots surface per-file text on final_deliverables."""
         repl = LocalREPL(deliverable_slots=["a.md", "b.md"])
-        assert repl.locals["answer"]["deliverables"] == {"a.md": "", "b.md": ""}
         result = repl.execute_code(
             'answer["deliverables"]["a.md"] = "AAA"\n'
             'answer["deliverables"]["b.md"] = "BBB"\n'
             'answer["ready"] = True'
         )
         assert result.final_deliverables == {"a.md": "AAA", "b.md": "BBB"}
+        assert result.final_answer is None
+        repl.cleanup()
+
+    def test_slot_mode_single_slot(self):
+        """A single slot surfaces on final_deliverables (content stays None)."""
+        repl = LocalREPL(deliverable_slots=["answer"])
+        result = repl.execute_code(
+            'answer["deliverables"]["answer"] = "the result"\nanswer["ready"] = True'
+        )
+        assert result.final_deliverables == {"answer": "the result"}
+        assert result.final_answer is None
         repl.cleanup()
 
     def test_llm_query_no_handler(self):
@@ -231,9 +250,17 @@ class TestLocalREPLScaffoldRestoration:
     def test_answer_rewrap_after_rebind(self):
         """If the model rebinds ``answer`` to a plain dict, the next cell still triggers on ready=True."""
         repl = LocalREPL()
-        repl.execute_code('answer = {"deliverables": {"answer": "intermediate"}, "ready": False}')
+        repl.execute_code('answer = {"content": "intermediate", "ready": False}')
         # After scaffold restore, the rebound dict has been wrapped back into the
         # tracking subclass; setting ready=True now must fire the capture callback.
+        result = repl.execute_code('answer["content"] = "done"; answer["ready"] = True')
+        assert result.final_answer == "done"
+        repl.cleanup()
+
+    def test_answer_rewrap_after_rebind_slot_mode(self):
+        """Slot-mode rebind to a plain dict is still captured on the next cell."""
+        repl = LocalREPL(deliverable_slots=["answer"])
+        repl.execute_code('answer = {"deliverables": {"answer": "intermediate"}, "ready": False}')
         result = repl.execute_code(
             'answer["deliverables"]["answer"] = "done"; answer["ready"] = True'
         )

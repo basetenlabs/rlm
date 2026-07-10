@@ -123,7 +123,10 @@ def _build_exec_script(
     LLM queries go through the local broker server.
     """
     code_b64 = base64.b64encode(code.encode()).decode()
-    seed_deliverables = {name: "" for name in normalize_slots(deliverable_slots)}
+    slot_mode = deliverable_slots is not None
+    seed_deliverables = (
+        {name: "" for name in normalize_slots(deliverable_slots)} if slot_mode else {}
+    )
 
     return textwrap.dedent(
         f'''
@@ -135,6 +138,7 @@ import traceback
 import os
 import requests
 
+_RLM_SLOT_MODE = {slot_mode!r}
 _RLM_DELIVERABLE_SEED = {seed_deliverables!r}
 
 try:
@@ -226,7 +230,10 @@ def serialize_locals(state):
 _locals = load_state()
 
 if "answer" not in _locals or not isinstance(_locals.get("answer"), dict):
-    _locals["answer"] = {{"deliverables": dict(_RLM_DELIVERABLE_SEED), "ready": False}}
+    if _RLM_SLOT_MODE:
+        _locals["answer"] = {{"deliverables": dict(_RLM_DELIVERABLE_SEED), "ready": False}}
+    else:
+        _locals["answer"] = {{"content": "", "ready": False}}
 
 def SHOW_VARS():
     available = {{k: type(v).__name__ for k, v in _locals.items() if not k.startswith("_") and k != "answer"}}
@@ -271,17 +278,22 @@ if "history_0" in _locals:
 save_state(_locals)
 
 _ans = _locals.get("answer") if isinstance(_locals.get("answer"), dict) else None
-_final = None
+_final_answer = None
+_final_deliverables = None
 if _ans is not None and _ans.get("ready"):
-    _deliv = _ans.get("deliverables")
-    if not isinstance(_deliv, dict):
-        _deliv = {{}}
-    _final = {{str(_k): str(_v) for _k, _v in _deliv.items()}}
+    if _RLM_SLOT_MODE:
+        _deliv = _ans.get("deliverables")
+        if not isinstance(_deliv, dict):
+            _deliv = {{}}
+        _final_deliverables = {{str(_k): str(_v) for _k, _v in _deliv.items()}}
+    else:
+        _final_answer = str(_ans.get("content", ""))
 result = {{
     "stdout": stdout_buf.getvalue(),
     "stderr": stderr_buf.getvalue(),
     "locals": serialize_locals(_locals),
-    "final_deliverables": _final,
+    "final_answer": _final_answer,
+    "final_deliverables": _final_deliverables,
 }}
 print(json.dumps(result))
 '''
@@ -321,7 +333,11 @@ class PrimeREPL(IsolatedEnv):
                 "Persistent REPLs are currently not supported for environment: PrimeREPL"
             )
 
-        self.deliverable_slots = normalize_slots(deliverable_slots)
+        # None -> content mode (``answer["content"]``); a list -> slot mode.
+        self._slot_mode = deliverable_slots is not None
+        self.deliverable_slots = (
+            normalize_slots(deliverable_slots) if self._slot_mode else None
+        )
         self.name = name
         self.docker_image = docker_image
         self.timeout_minutes = timeout_minutes
@@ -570,6 +586,7 @@ class PrimeREPL(IsolatedEnv):
                 locals=parsed.get("locals", {}),
                 execution_time=execution_time,
                 rlm_calls=pending_calls,
+                final_answer=parsed.get("final_answer"),
                 final_deliverables=parsed.get("final_deliverables"),
             )
         except json.JSONDecodeError:

@@ -383,21 +383,20 @@ class TestScaffoldRestoration:
 # answer dict semantics
 # =========================================================================== #
 class TestAnswerSemantics:
-    def test_answer_ready_surfaces_final_deliverables(self):
+    def test_answer_ready_surfaces_final_answer(self):
         repl = make_repl(with_handler=False)
         try:
-            r = repl.execute_code(
-                "answer['deliverables']['answer'] = 'done'; answer['ready'] = True"
-            )
-            assert r.final_deliverables == {"answer": "done"}
+            r = repl.execute_code("answer['content'] = 'done'; answer['ready'] = True")
+            assert r.final_answer == "done"
+            assert r.final_deliverables is None
         finally:
             teardown_repl(repl)
 
     def test_answer_not_ready_is_none(self):
         repl = make_repl(with_handler=False)
         try:
-            r = repl.execute_code("answer['deliverables']['answer'] = 'partial'")
-            assert r.final_deliverables is None
+            r = repl.execute_code("answer['content'] = 'partial'")
+            assert r.final_answer is None
         finally:
             teardown_repl(repl)
 
@@ -405,27 +404,23 @@ class TestAnswerSemantics:
         repl = make_repl(with_handler=False)
         try:
             r = repl.execute_code("answer['ready'] = True")
-            assert r.final_deliverables == {"answer": ""}, (
-                f"expected empty slot got {r.final_deliverables!r}"
-            )
+            assert r.final_answer == "", f"expected '' got {r.final_answer!r}"
         finally:
             teardown_repl(repl)
 
     def test_answer_nonstring_content_coerced(self):
         repl = make_repl(with_handler=False)
         try:
-            r = repl.execute_code(
-                "answer['deliverables']['answer'] = 1234; answer['ready'] = True"
-            )
-            assert r.final_deliverables == {"answer": "1234"}
+            r = repl.execute_code("answer['content'] = 1234; answer['ready'] = True")
+            assert r.final_answer == "1234"
         finally:
             teardown_repl(repl)
 
     def test_answer_plain_dict_reassignment_surfaces(self):
         repl = make_repl(with_handler=False)
         try:
-            r = repl.execute_code("answer = {'deliverables': {'answer': 'X'}, 'ready': True}")
-            assert r.final_deliverables == {"answer": "X"}
+            r = repl.execute_code("answer = {'content': 'X', 'ready': True}")
+            assert r.final_answer == "X"
         finally:
             teardown_repl(repl)
 
@@ -434,14 +429,24 @@ class TestAnswerSemantics:
         the next turn (persistent multi-turn)."""
         repl = make_repl()
         try:
-            r1 = repl.execute_code(
-                "answer['deliverables']['answer'] = 'stale'; answer['ready'] = True"
-            )
-            assert r1.final_deliverables == {"answer": "stale"}
+            r1 = repl.execute_code("answer['content'] = 'stale'; answer['ready'] = True")
+            assert r1.final_answer == "stale"
             repl.update_handler_address(repl.lm_handler_address)
-            r2 = repl.execute_code("print(answer['ready'], repr(answer['deliverables']))")
-            assert r2.stdout.strip() == "False {'answer': ''}", r2.stdout
-            assert r2.final_deliverables is None
+            r2 = repl.execute_code("print(answer['ready'], repr(answer['content']))")
+            assert r2.stdout.strip() == "False ''", r2.stdout
+            assert r2.final_answer is None
+        finally:
+            teardown_repl(repl)
+
+    def test_slot_mode_surfaces_final_deliverables(self):
+        repl = make_repl(with_handler=False, deliverable_slots=["a.md", "b.md"])
+        try:
+            r = repl.execute_code(
+                "answer['deliverables']['a.md'] = 'AAA'; "
+                "answer['deliverables']['b.md'] = 'BBB'; answer['ready'] = True"
+            )
+            assert r.final_deliverables == {"a.md": "AAA", "b.md": "BBB"}
+            assert r.final_answer is None
         finally:
             teardown_repl(repl)
 
@@ -538,7 +543,7 @@ class TestStateAndOutput:
             r = repl.execute_code("print('before')\nraise ValueError('kaboom')")
             assert "before" in r.stdout
             assert "ValueError" in r.stderr and "kaboom" in r.stderr
-            assert r.final_deliverables is None
+            assert r.final_answer is None
         finally:
             teardown_repl(repl)
 

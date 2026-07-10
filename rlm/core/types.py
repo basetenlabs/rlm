@@ -188,9 +188,14 @@ class REPLResult:
     locals: dict
     execution_time: float
     llm_calls: list["RLMChatCompletion"]
-    # Per-deliverable final output captured when the model set
-    # ``answer["ready"] = True``. Keys are the exact deliverable filenames
-    # (or the single ``"answer"`` slot for generic use). None until finalized.
+    # Final output captured when the model set ``answer["ready"] = True``.
+    # Exactly one of these is set, keyed on the answer protocol in play:
+    #   * content mode (default ``RLM``, no deliverable slots):
+    #       ``final_answer`` holds the ``answer["content"]`` string.
+    #   * slot mode (``MultiDeliverableRLM``, deliverable slots seeded):
+    #       ``final_deliverables`` holds {exact filename: text}.
+    # Both are None until the loop is finalized.
+    final_answer: str | None = None
     final_deliverables: dict[str, str] | None = None
 
     def __init__(
@@ -200,6 +205,7 @@ class REPLResult:
         locals: dict,
         execution_time: float = None,
         rlm_calls: list["RLMChatCompletion"] = None,
+        final_answer: str | None = None,
         final_deliverables: dict[str, str] | None = None,
     ):
         self.stdout = stdout
@@ -207,6 +213,7 @@ class REPLResult:
         self.locals = locals
         self.execution_time = execution_time
         self.rlm_calls = rlm_calls or []
+        self.final_answer = final_answer
         self.final_deliverables = final_deliverables
 
     def __str__(self):
@@ -219,6 +226,7 @@ class REPLResult:
             "locals": {k: _serialize_value(v) for k, v in self.locals.items()},
             "execution_time": self.execution_time,
             "rlm_calls": [call.to_dict() for call in self.rlm_calls],
+            "final_answer": self.final_answer,
             "final_deliverables": self.final_deliverables,
         }
 

@@ -1,4 +1,4 @@
-from rlm.core.rlm import RLM
+from rlm.core.rlm import RLM, MultiDeliverableRLM
 from rlm.utils.exceptions import (
     BudgetExceededError,
     CancellationError,
@@ -9,6 +9,7 @@ from rlm.utils.exceptions import (
 
 __all__ = [
     "RLM",
+    "MultiDeliverableRLM",
     "BudgetExceededError",
     "TimeoutExceededError",
     "TokenLimitExceededError",

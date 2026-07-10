@@ -107,7 +107,8 @@ class _SubcallBroker:
     ``subcall_fn`` finishes after that cell has timed out):
         {"type": "subcall", "prompt": str, "model": str | None, "cell_id": str}
         {"type": "subcall_batched", "prompts": [str], "model": str | None, "cell_id": str}
-        {"type": "answer", "deliverables": dict[str, str], "cell_id": str}
+        {"type": "answer", "content": str, "cell_id": str}                # content mode
+        {"type": "answer", "deliverables": dict[str, str], "cell_id": str}  # slot mode
 
     Responses:
         subcall:          {"completion": RLMChatCompletion.to_dict()} | {"error": str}
@@ -135,11 +136,13 @@ class _SubcallBroker:
         # only bound concurrency within a single batched request.
         self._subcall_semaphore = threading.Semaphore(max(1, max_concurrent))
         self._shutting_down = False
-        # Indexed by ``cell_id`` so completions and final_answers from a
+        # Indexed by ``cell_id`` so completions and final answers from a
         # subcall that finishes *after* its origin cell timed out don't
-        # get misattributed to a later cell.
+        # get misattributed to a later cell. The final payload is a tagged
+        # tuple ``("content", str)`` or ``("deliverables", dict)`` so drain
+        # can restore the right REPLResult field regardless of protocol.
         self._completions_by_cell: dict[str, list[RLMChatCompletion]] = {}
-        self._final_deliverables_by_cell: dict[str, dict[str, str]] = {}
+        self._final_by_cell: dict[str, tuple[str, Any]] = {}
 
     def start(self) -> tuple[str, int]:
         parent = self
@@ -195,13 +198,19 @@ class _SubcallBroker:
         cell_id = data.get("cell_id") or ""
 
         if req_type == "answer":
-            deliverables = data.get("deliverables")
-            if not isinstance(deliverables, dict):
-                deliverables = {}
+            if "deliverables" in data:
+                deliverables = data.get("deliverables")
+                if not isinstance(deliverables, dict):
+                    deliverables = {}
+                payload: tuple[str, Any] = (
+                    "deliverables",
+                    {str(k): str(v) for k, v in deliverables.items()},
+                )
+            else:
+                content = data.get("content")
+                payload = ("content", str(content) if content is not None else "")
             with self._lock:
-                self._final_deliverables_by_cell[cell_id] = {
-                    str(k): str(v) for k, v in deliverables.items()
-                }
+                self._final_by_cell[cell_id] = payload
             return {"ok": True}
 
         if req_type == "subcall":
@@ -279,10 +288,14 @@ class _SubcallBroker:
 
     def drain(
         self, cell_id: str | None = None
-    ) -> tuple[list[RLMChatCompletion], dict[str, str] | None]:
-        """Pop completions and the final deliverables for a cell, discard the rest.
+    ) -> tuple[list[RLMChatCompletion], tuple[str, Any] | None]:
+        """Pop completions and the final answer payload for a cell, discard the rest.
 
-        ``drain(cell_id)`` returns this cell's completions+deliverables and
+        The final payload is the tagged tuple stored by ``_dispatch``:
+        ``("content", str)`` (content mode) or ``("deliverables", dict)`` (slot
+        mode), or None if the cell never finalized.
+
+        ``drain(cell_id)`` returns this cell's completions+payload and
         unconditionally clears any entries belonging to *other* cells —
         those are stragglers from a prior cell that timed out before its
         own ``subcall_fn`` finished, and they must not bleed into a future
@@ -294,14 +307,14 @@ class _SubcallBroker:
         with self._lock:
             if cell_id is None:
                 self._completions_by_cell.clear()
-                self._final_deliverables_by_cell.clear()
+                self._final_by_cell.clear()
                 return [], None
             completions = self._completions_by_cell.pop(cell_id, [])
-            final = self._final_deliverables_by_cell.pop(cell_id, None)
+            final = self._final_by_cell.pop(cell_id, None)
             # Discard stragglers from other (now-defunct) cells so they
             # don't get attributed to a later drain.
             self._completions_by_cell.clear()
-            self._final_deliverables_by_cell.clear()
+            self._final_by_cell.clear()
         return completions, final
 
 
@@ -317,11 +330,20 @@ def _build_kernel_bootstrap(
     subcall_timeout: float | None,
     deliverable_slots: list[str] | None = None,
 ) -> str:
-    """Code executed once inside the kernel to wire up scaffold helpers."""
+    """Code executed once inside the kernel to wire up scaffold helpers.
+
+    Two answer protocols, gated on ``deliverable_slots``:
+      * None (default): content mode -- ``answer`` seeds ``{"content": ""}`` and
+        the ready-request carries ``{"type": "answer", "content": ...}``.
+      * list: slot mode -- ``answer`` seeds ``{"deliverables": {...}}`` and the
+        ready-request carries ``{"type": "answer", "deliverables": {...}}``.
+    """
     # Python literal for the initial answer["deliverables"] seed. Injected as a
     # single f-string field so the ``{{ }}``-escaped template stays intact.
-    slots = normalize_slots(deliverable_slots)
-    seed_deliverables = {name: "" for name in slots}
+    slot_mode = deliverable_slots is not None
+    seed_deliverables = (
+        {name: "" for name in normalize_slots(deliverable_slots)} if slot_mode else {}
+    )
     return textwrap.dedent(
         f"""
         import json as _rlm_json
@@ -332,6 +354,7 @@ def _build_kernel_bootstrap(
         _RLM_SUBCALL_ADDRESS = {list(subcall_address) if subcall_address else None!r}
         _RLM_DEPTH = {depth}
         _RLM_SUBCALL_TIMEOUT = {subcall_timeout!r}
+        _RLM_SLOT_MODE = {slot_mode!r}
         _RLM_DELIVERABLE_SEED = {seed_deliverables!r}
         # Updated by the parent before each user cell. Tagged onto every
         # broker request so completions / answer-dict captures can be
@@ -431,22 +454,32 @@ def _build_kernel_bootstrap(
         class _RLMAnswerDict(dict):
             def __init__(self):
                 super().__init__()
-                dict.__setitem__(self, "deliverables", dict(_RLM_DELIVERABLE_SEED))
+                if _RLM_SLOT_MODE:
+                    dict.__setitem__(self, "deliverables", dict(_RLM_DELIVERABLE_SEED))
+                else:
+                    dict.__setitem__(self, "content", "")
                 dict.__setitem__(self, "ready", False)
             def __setitem__(self, key, value):
                 dict.__setitem__(self, key, value)
                 if key == "ready" and value:
                     try:
-                        _deliverables = self.get("deliverables") or {{}}
-                        if not isinstance(_deliverables, dict):
-                            _deliverables = {{}}
-                        _rlm_request(_RLM_SUBCALL_ADDRESS, {{
-                            "type": "answer",
-                            "deliverables": {{
-                                str(_k): str(_v) for _k, _v in _deliverables.items()
-                            }},
-                            "cell_id": _RLM_CURRENT_CELL,
-                        }})
+                        if _RLM_SLOT_MODE:
+                            _deliverables = self.get("deliverables") or {{}}
+                            if not isinstance(_deliverables, dict):
+                                _deliverables = {{}}
+                            _rlm_request(_RLM_SUBCALL_ADDRESS, {{
+                                "type": "answer",
+                                "deliverables": {{
+                                    str(_k): str(_v) for _k, _v in _deliverables.items()
+                                }},
+                                "cell_id": _RLM_CURRENT_CELL,
+                            }})
+                        else:
+                            _rlm_request(_RLM_SUBCALL_ADDRESS, {{
+                                "type": "answer",
+                                "content": str(self.get("content", "")),
+                                "cell_id": _RLM_CURRENT_CELL,
+                            }})
                     except Exception:
                         pass
 
@@ -577,7 +610,12 @@ class IPythonREPL(NonIsolatedEnv):
 
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn
-        self.deliverable_slots = normalize_slots(deliverable_slots)
+        # Answer protocol: ``deliverable_slots is None`` -> content mode
+        # (``answer["content"]``); a list -> slot mode (``answer["deliverables"]``).
+        self._slot_mode = deliverable_slots is not None
+        self.deliverable_slots = (
+            normalize_slots(deliverable_slots) if self._slot_mode else None
+        )
         self.kernel_mode: KernelMode = kernel_mode
         # Normalize cell_timeout: 0 or negative is meaningless (subprocess
         # mode would interpret it as "give up immediately"). Treat as
@@ -634,8 +672,10 @@ class IPythonREPL(NonIsolatedEnv):
         # ``self.locals``.
         self._subprocess_shadow: dict[str, Any] = {}
 
-        # Tracking state for LLM calls / final deliverables during execute_code.
+        # Tracking state for LLM calls / final answer during execute_code.
+        # Exactly one final field is populated depending on the answer protocol.
         self._pending_llm_calls: list[RLMChatCompletion] = []
+        self._last_final_answer: str | None = None
         self._last_final_deliverables: dict[str, str] | None = None
 
         # In-process: IPython shell instance
@@ -853,11 +893,18 @@ class IPythonREPL(NonIsolatedEnv):
     # Scaffold helpers (in-process only; subprocess has its own in the kernel)
     # -------------------------------------------------------------------------
 
-    def _capture_answer(self, deliverables: dict[str, str]) -> None:
-        """Called by ``_AnswerDict`` when the model sets ``answer["ready"] = True``."""
-        self._last_final_deliverables = {
-            str(k): str(v) for k, v in (deliverables or {}).items()
-        }
+    def _capture_answer(self, result) -> None:
+        """Called by ``_AnswerDict`` when the model sets ``answer["ready"] = True``.
+
+        In slot mode ``result`` is the deliverables dict; in content mode it is
+        the ``answer["content"]`` value.
+        """
+        if self._slot_mode:
+            self._last_final_deliverables = {
+                str(k): str(v) for k, v in (result or {}).items()
+            }
+        else:
+            self._last_final_answer = str(result) if result is not None else ""
 
     @staticmethod
     def _disabled_input(*_args: Any, **_kwargs: Any) -> str:
@@ -1190,6 +1237,7 @@ class IPythonREPL(NonIsolatedEnv):
             # ``execute_code`` call from another thread would clobber the
             # in-flight cell's bookkeeping.
             self._pending_llm_calls = []
+            self._last_final_answer = None
             self._last_final_deliverables = None
 
             if use_alarm:
@@ -1249,7 +1297,9 @@ class IPythonREPL(NonIsolatedEnv):
             # Snapshot bookkeeping under the lock too — reading and clearing
             # outside lets a concurrent thread overwrite/wipe the state we're
             # about to report.
+            final_answer = self._last_final_answer
             final_deliverables = self._last_final_deliverables
+            self._last_final_answer = None
             self._last_final_deliverables = None
             rlm_calls = self._pending_llm_calls.copy()
 
@@ -1259,6 +1309,7 @@ class IPythonREPL(NonIsolatedEnv):
             locals=locals_snapshot,
             execution_time=time.perf_counter() - start_time,
             rlm_calls=rlm_calls,
+            final_answer=final_answer,
             final_deliverables=final_deliverables,
         )
 
@@ -1385,9 +1436,20 @@ class IPythonREPL(NonIsolatedEnv):
         # than attributing them to this cell.
         if drain_broker:
             assert cell_id is not None
-            completions, final_deliverables = self._broker.drain(cell_id)
+            completions, final_payload = self._broker.drain(cell_id)
         else:
-            completions, final_deliverables = [], None
+            completions, final_payload = [], None
+
+        # ``final_payload`` is the tagged tuple ("content", str) /
+        # ("deliverables", dict), or None. Route it to the matching field.
+        final_answer = None
+        final_deliverables = None
+        if final_payload is not None:
+            kind, value = final_payload
+            if kind == "deliverables":
+                final_deliverables = value
+            else:
+                final_answer = value
 
         return REPLResult(
             stdout="".join(stdout_parts),
@@ -1395,6 +1457,7 @@ class IPythonREPL(NonIsolatedEnv):
             locals={},  # serializing arbitrary user_ns through ZMQ is costly; skip for now
             execution_time=time.perf_counter() - start_time,
             rlm_calls=list(completions),
+            final_answer=final_answer,
             final_deliverables=final_deliverables,
         )
 
@@ -1422,10 +1485,13 @@ class IPythonREPL(NonIsolatedEnv):
             if isinstance(current, dict):
                 for k, v in current.items():
                     dict.__setitem__(replacement, k, v)
-                if current.get("ready") and self._last_final_deliverables is None:
-                    deliverables = current.get("deliverables") or {}
-                    if isinstance(deliverables, dict):
-                        self._capture_answer(deliverables)
+                if current.get("ready"):
+                    if self._slot_mode and self._last_final_deliverables is None:
+                        deliverables = current.get("deliverables") or {}
+                        if isinstance(deliverables, dict):
+                            self._capture_answer(deliverables)
+                    elif not self._slot_mode and self._last_final_answer is None:
+                        self._capture_answer(current.get("content", ""))
             ns["answer"] = replacement
         if "context_0" in ns:
             ns["context"] = ns["context_0"]

@@ -41,18 +41,29 @@ def normalize_slots(slots: list[str] | None) -> list[str]:
 class _AnswerDict(dict):
     """REPL-visible dict where ``answer["ready"] = True`` signals completion.
 
-    The model writes each deliverable's full text into
-    ``answer["deliverables"]["<filename>"]`` (slots pre-seeded from the caller's
-    expected deliverable names, or a single ``"answer"`` slot by default), then
-    sets ``answer["ready"] = True``. The first time ``ready`` flips truthy the
-    dict invokes ``on_ready`` with the whole ``deliverables`` dict so the env
-    can capture it; the next ``execute_code`` surfaces it as
-    ``REPLResult.final_deliverables``.
+    Two protocols, gated on whether ``slots`` is passed:
+
+    * Content mode (``slots is None`` — the default upstream ``RLM``): seeded as
+      ``{"content": "", "ready": False}``. The model sets ``answer["content"]``,
+      then ``answer["ready"] = True``. On ready, ``on_ready`` receives the
+      ``content`` value (a string); the next ``execute_code`` surfaces it as
+      ``REPLResult.final_answer``.
+    * Slot mode (``slots`` is a list — ``MultiDeliverableRLM``): seeded as
+      ``{"deliverables": {name: "" for name in slots}, "ready": False}``. The
+      model fills each slot, then ``answer["ready"] = True``. On ready,
+      ``on_ready`` receives the whole ``deliverables`` dict; the next
+      ``execute_code`` surfaces it as ``REPLResult.final_deliverables``.
     """
 
     def __init__(self, on_ready=None, slots: list[str] | None = None):
         super().__init__()
-        super().__setitem__("deliverables", {name: "" for name in normalize_slots(slots)})
+        # slots is None -> content mode; a list -> slot mode. Distinguish here
+        # (not via ``if slots``) so an explicit empty list still selects slots.
+        self._slot_mode = slots is not None
+        if self._slot_mode:
+            super().__setitem__("deliverables", {name: "" for name in normalize_slots(slots)})
+        else:
+            super().__setitem__("content", "")
         super().__setitem__("ready", False)
         self._on_ready = on_ready
 
@@ -60,8 +71,13 @@ class _AnswerDict(dict):
         super().__setitem__(key, value)
         if key == "ready" and value and self._on_ready is not None:
             try:
-                deliverables = self.get("deliverables") or {}
-                self._on_ready(dict(deliverables) if isinstance(deliverables, dict) else {})
+                if self._slot_mode:
+                    deliverables = self.get("deliverables") or {}
+                    self._on_ready(
+                        dict(deliverables) if isinstance(deliverables, dict) else {}
+                    )
+                else:
+                    self._on_ready(self.get("content", ""))
             except Exception:
                 pass
 
@@ -191,9 +207,13 @@ class LocalREPL(NonIsolatedEnv):
             **kwargs,
         )
 
-        # Slot names for ``answer["deliverables"]`` (exact deliverable filenames,
-        # or a single "answer" slot by default).
-        self.deliverable_slots = normalize_slots(deliverable_slots)
+        # Answer protocol: ``deliverable_slots is None`` -> content mode
+        # (upstream ``answer["content"]``); a list -> slot mode
+        # (``answer["deliverables"]`` seeded with these names).
+        self._slot_mode = deliverable_slots is not None
+        self.deliverable_slots = (
+            normalize_slots(deliverable_slots) if self._slot_mode else None
+        )
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn  # Callback for recursive RLM calls (depth > 1 support)
         self.original_cwd = os.getcwd()
@@ -240,6 +260,8 @@ class LocalREPL(NonIsolatedEnv):
         # Track LLM calls made during code execution
         self._pending_llm_calls: list[RLMChatCompletion] = []
         # Captured the first time the model sets ``answer["ready"] = True``.
+        # Exactly one is populated depending on the answer protocol.
+        self._last_final_answer: str | None = None
         self._last_final_deliverables: dict[str, str] | None = None
 
         # Add helper functions
@@ -266,10 +288,13 @@ class LocalREPL(NonIsolatedEnv):
                 # For non-callable values (constants, data), add to locals
                 self.locals[name] = value
 
-    def _capture_answer(self, deliverables: dict[str, str]) -> None:
-        self._last_final_deliverables = {
-            str(k): str(v) for k, v in (deliverables or {}).items()
-        }
+    def _capture_answer(self, result) -> None:
+        if self._slot_mode:
+            self._last_final_deliverables = {
+                str(k): str(v) for k, v in (result or {}).items()
+            }
+        else:
+            self._last_final_answer = str(result) if result is not None else ""
 
     def _show_vars(self) -> str:
         """Show all available variables in the REPL environment."""
@@ -563,10 +588,13 @@ class LocalREPL(NonIsolatedEnv):
                     if isinstance(current, dict):
                         for k, v in current.items():
                             dict.__setitem__(replacement, k, v)
-                        if current.get("ready") and self._last_final_deliverables is None:
-                            deliverables = current.get("deliverables") or {}
-                            if isinstance(deliverables, dict):
-                                self._capture_answer(deliverables)
+                        if current.get("ready"):
+                            if self._slot_mode and self._last_final_deliverables is None:
+                                deliverables = current.get("deliverables") or {}
+                                if isinstance(deliverables, dict):
+                                    self._capture_answer(deliverables)
+                            elif not self._slot_mode and self._last_final_answer is None:
+                                self._capture_answer(current.get("content", ""))
                     self.locals["answer"] = replacement
             elif name == "context" and "context_0" in self.locals:
                 self.locals["context"] = self.locals["context_0"]
@@ -601,7 +629,9 @@ class LocalREPL(NonIsolatedEnv):
                 stdout = stdout_buf.getvalue()
                 stderr = stderr_buf.getvalue() + f"\n{type(e).__name__}: {e}"
 
+        final_answer = self._last_final_answer
         final_deliverables = self._last_final_deliverables
+        self._last_final_answer = None
         self._last_final_deliverables = None
 
         return REPLResult(
@@ -610,6 +640,7 @@ class LocalREPL(NonIsolatedEnv):
             locals=self.locals.copy(),
             execution_time=time.perf_counter() - start_time,
             rlm_calls=self._pending_llm_calls.copy(),
+            final_answer=final_answer,
             final_deliverables=final_deliverables,
         )
 

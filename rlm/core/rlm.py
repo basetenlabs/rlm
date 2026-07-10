@@ -33,6 +33,7 @@ from rlm.utils.parsing import (
 )
 from rlm.utils.prompts import (
     RLM_SYSTEM_PROMPT,
+    RLM_SYSTEM_PROMPT_SLOTS,
     QueryMetadata,
     build_rlm_system_prompt,
     build_user_prompt,
@@ -199,7 +200,16 @@ class RLM:
         self.max_timeout = max_timeout
         self.max_tokens = max_tokens
         self.max_errors = max_errors
-        self.system_prompt = custom_system_prompt if custom_system_prompt else RLM_SYSTEM_PROMPT
+        # Default prompt tracks the answer protocol: slot mode
+        # (``deliverable_slots`` set, e.g. ``MultiDeliverableRLM``) describes the
+        # ``answer["deliverables"]`` slots; otherwise the upstream
+        # ``answer["content"]`` protocol. A ``custom_system_prompt`` overrides both.
+        if custom_system_prompt:
+            self.system_prompt = custom_system_prompt
+        elif deliverable_slots is not None:
+            self.system_prompt = RLM_SYSTEM_PROMPT_SLOTS
+        else:
+            self.system_prompt = RLM_SYSTEM_PROMPT
         self.orchestrator = orchestrator
         # "orchestrator" (default) or "direct-read" (delegation-neutral
         # addendum for force/direct-read roots; see prompts.DIRECT_READ_ADDENDUM).
@@ -219,9 +229,12 @@ class RLM:
         # no corrective signal and can pattern-lock it (GLM-5.2 thinking-off
         # perseveration, 2026-07-09 probe). Set False to reproduce old behavior.
         self.nudge_on_no_code = nudge_on_no_code
-        # Pre-seed ``answer["deliverables"]`` with one empty slot per expected
-        # deliverable filename. None/empty -> a single generic "answer" slot.
+        # Answer protocol. Default ``RLM`` (``deliverable_slots is None``) uses
+        # the upstream ``answer["content"]`` protocol. ``MultiDeliverableRLM``
+        # passes ``deliverable_slots`` -> the per-deliverable-slot protocol
+        # (``answer["deliverables"]`` pre-seeded with one slot per filename).
         self.deliverable_slots = deliverable_slots
+        self._slot_mode = deliverable_slots is not None
         self.logger = logger
         self.verbose = VerbosePrinter(enabled=verbose)
 
@@ -458,18 +471,29 @@ class RLM:
                     # Check error/budget/token limits after each iteration
                     self._check_iteration_limits(iteration, i, lm_handler)
 
-                    # The REPL signals completion by populating
-                    # ``answer["deliverables"]`` and setting ``answer["ready"] = True``.
-                    # Each environment surfaces that on ``REPLResult.final_deliverables``.
+                    # The REPL signals completion by setting
+                    # ``answer["ready"] = True``. In content mode (default) the
+                    # env surfaces ``answer["content"]`` on
+                    # ``REPLResult.final_answer``; in slot mode
+                    # (``MultiDeliverableRLM``) it surfaces the per-deliverable
+                    # dict on ``REPLResult.final_deliverables``.
+                    final_answer = None
                     final_deliverables = None
                     for block in iteration.code_blocks:
-                        if getattr(block.result, "final_deliverables", None) is not None:
-                            final_deliverables = block.result.final_deliverables
-                            break
-                    final_answer = (
-                        render_deliverables(final_deliverables)
-                        if final_deliverables is not None
-                        else None
+                        if self._slot_mode:
+                            if getattr(block.result, "final_deliverables", None) is not None:
+                                final_deliverables = block.result.final_deliverables
+                                break
+                        else:
+                            if getattr(block.result, "final_answer", None) is not None:
+                                final_answer = block.result.final_answer
+                                break
+                    if self._slot_mode and final_deliverables is not None:
+                        final_answer = render_deliverables(final_deliverables)
+                    finalized = (
+                        final_deliverables is not None
+                        if self._slot_mode
+                        else final_answer is not None
                     )
                     iteration.final_answer = final_answer
 
@@ -484,11 +508,14 @@ class RLM:
                     # Verbose output for this iteration
                     self.verbose.print_iteration(iteration, i + 1)
 
-                    if final_deliverables is not None:
-                        final_deliverables = self._recover_if_stub(
-                            final_deliverables, environment
-                        )
-                        final_answer = render_deliverables(final_deliverables)
+                    if finalized:
+                        if self._slot_mode:
+                            final_deliverables = self._recover_if_stub(
+                                final_deliverables, environment
+                            )
+                            final_answer = render_deliverables(final_deliverables)
+                        else:
+                            final_answer = self._recover_if_stub(final_answer, environment)
                         time_end = time.perf_counter()
                         usage = lm_handler.get_usage_summary()
                         self.verbose.print_final_answer(final_answer)
@@ -530,15 +557,20 @@ class RLM:
                 ) from None
 
             # Default behavior: we run out of iterations, provide one final answer.
-            # The model never populated the deliverable slots, so fold the
-            # generated fallback into a single slot (all slots get the same text
-            # when there are several) and run stub-recovery per slot.
+            # The model never finalized, so generate a fallback. In slot mode we
+            # fold that fallback into every deliverable slot (there is no way to
+            # know which slot it belongs to) and run stub-recovery per slot; in
+            # content mode we recover a single string.
             time_end = time.perf_counter()
             fallback = self._default_answer(message_history, lm_handler)
-            slots = self._resolve_slots(environment)
-            final_deliverables = {name: fallback for name in slots}
-            final_deliverables = self._recover_if_stub(final_deliverables, environment)
-            final_answer = render_deliverables(final_deliverables)
+            if self._slot_mode:
+                slots = self._resolve_slots(environment)
+                final_deliverables = {name: fallback for name in slots}
+                final_deliverables = self._recover_if_stub(final_deliverables, environment)
+                final_answer = render_deliverables(final_deliverables)
+            else:
+                final_deliverables = None
+                final_answer = self._recover_if_stub(fallback, environment)
             usage = lm_handler.get_usage_summary()
             self.verbose.print_final_answer(final_answer)
             self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
@@ -568,30 +600,38 @@ class RLM:
             return list(self.deliverable_slots)
         return [DEFAULT_DELIVERABLE_SLOT]
 
-    def _recover_if_stub(
-        self, deliverables: dict[str, str] | None, environment
-    ) -> dict[str, str] | None:
-        """Safety net for finalize-protocol non-compliance, applied per slot.
+    def _recover_if_stub(self, answer, environment):
+        """Safety net for finalize-protocol non-compliance.
 
         Some models (e.g. DeepSeek V4 Pro) build the full deliverable in a REPL
-        variable but then set the slot to a short confirmation ("the report has
-        been saved to ..."), producing a stub. When a slot's text is
+        variable but then set the answer to a short confirmation ("the report
+        has been saved to ..."), producing a stub. When the finalized text is
         suspiciously short, recover the largest report-like string from the REPL
         namespace (``environment.locals``) instead. Model- and
         variable-name-agnostic: scans all user string variables.
 
-        NOTE: with multiple stubbed slots this recovers the *same* largest
-        variable into each — there is no reliable way to map a REPL variable
-        back to a specific deliverable filename. In practice recovery only fires
-        for single-deliverable stubs; multi-deliverable runs that finalize
-        properly never enter this path.
+        Works in both answer protocols: a ``str`` (content mode) recovers a
+        single string; a ``dict`` (slot mode) recovers per slot.
+
+        NOTE (slot mode): with multiple stubbed slots this recovers the *same*
+        largest variable into each — there is no reliable way to map a REPL
+        variable back to a specific deliverable filename. In practice recovery
+        only fires for single-deliverable stubs; multi-deliverable runs that
+        finalize properly never enter this path.
         """
-        if not deliverables:
-            return deliverables
         locals_ = getattr(environment, "locals", None)
-        return {
-            name: self._recover_slot(text, locals_) for name, text in deliverables.items()
-        }
+        if isinstance(answer, dict):
+            if not answer:
+                return answer
+            return {
+                name: self._recover_slot(text, locals_) for name, text in answer.items()
+            }
+        if answer is None:
+            return answer
+        recovered = self._recover_slot(answer, locals_)
+        # Preserve the upstream contract: return the original when nothing
+        # longer/better was found (recovery only substitutes on improvement).
+        return recovered if len(recovered) > len(answer or "") else answer
 
     @staticmethod
     def _recover_slot(text: str | None, locals_) -> str:
@@ -1051,3 +1091,27 @@ class RLM:
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         self.close()
         return False
+
+
+class MultiDeliverableRLM(RLM):
+    """RLM variant using the per-deliverable-slot answer protocol.
+
+    Where the base :class:`RLM` uses the upstream ``answer["content"]`` protocol,
+    this subclass pre-seeds ``answer["deliverables"]`` with one empty slot per
+    expected deliverable filename. The model fills each slot and sets
+    ``answer["ready"] = True``; the finalized :class:`RLMChatCompletion` exposes
+    the slots on ``.deliverables`` (with ``.response`` a rendered concat).
+
+    ``deliverable_slots`` is required — construct with the exact deliverable
+    filenames the task expects, e.g.
+    ``MultiDeliverableRLM(..., deliverable_slots=["memo.md", "table.csv"])``.
+    """
+
+    def __init__(self, *args, deliverable_slots: list[str] | None = None, **kwargs):
+        if not deliverable_slots:
+            raise ValueError(
+                "MultiDeliverableRLM requires a non-empty ``deliverable_slots`` "
+                "(one exact deliverable filename per slot). Use the base ``RLM`` "
+                "for the default answer['content'] protocol."
+            )
+        super().__init__(*args, deliverable_slots=deliverable_slots, **kwargs)

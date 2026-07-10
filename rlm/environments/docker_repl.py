@@ -267,7 +267,10 @@ def _build_exec_script(
     """Build the per-cell execution script that runs inside the container."""
     code_b64 = base64.b64encode(code.encode()).decode()
     custom_tools_code = _build_custom_tools_code(custom_tools)
-    seed_deliverables = {name: "" for name in normalize_slots(deliverable_slots)}
+    slot_mode = deliverable_slots is not None
+    seed_deliverables = (
+        {name: "" for name in normalize_slots(deliverable_slots)} if slot_mode else {}
+    )
     # In compaction mode the running summary list owns `history`; don't let the
     # versioned history_0 alias clobber it (the host re-injects it each turn).
     history_alias = (
@@ -287,6 +290,7 @@ except ImportError:
 PROXY = "http://host.docker.internal:{proxy_port}"
 STATE = "/workspace/state.dill"
 DEPTH = {depth}
+_RLM_SLOT_MODE = {slot_mode!r}
 _RLM_DELIVERABLE_SEED = {seed_deliverables!r}
 
 # Generous timeouts: plain LM calls can be slow; recursive RLM calls slower still.
@@ -350,8 +354,12 @@ def save_state(s):
 _locals = load_state()
 
 # Default answer dict on the first invocation; preserved across calls via state.
+# Slot mode seeds ``deliverables``; content mode seeds ``content``.
 if "answer" not in _locals or not isinstance(_locals.get("answer"), dict):
-    _locals["answer"] = {{"deliverables": dict(_RLM_DELIVERABLE_SEED), "ready": False}}
+    if _RLM_SLOT_MODE:
+        _locals["answer"] = {{"deliverables": dict(_RLM_DELIVERABLE_SEED), "ready": False}}
+    else:
+        _locals["answer"] = {{"content": "", "ready": False}}
 
 def SHOW_VARS():
     available = {{k: type(v).__name__ for k, v in _locals.items() if not k.startswith("_") and k != "answer"}}
@@ -396,17 +404,22 @@ if "context_0" in _locals:
 
 save_state(_locals)
 _ans = _locals.get("answer") if isinstance(_locals.get("answer"), dict) else None
-_final = None
+_final_answer = None
+_final_deliverables = None
 if _ans is not None and _ans.get("ready"):
-    _deliv = _ans.get("deliverables")
-    if not isinstance(_deliv, dict):
-        _deliv = {{}}
-    _final = {{str(_k): str(_v) for _k, _v in _deliv.items()}}
+    if _RLM_SLOT_MODE:
+        _deliv = _ans.get("deliverables")
+        if not isinstance(_deliv, dict):
+            _deliv = {{}}
+        _final_deliverables = {{str(_k): str(_v) for _k, _v in _deliv.items()}}
+    else:
+        _final_answer = str(_ans.get("content", ""))
 print(json.dumps({{
     "stdout": stdout_buf.getvalue(),
     "stderr": stderr_buf.getvalue(),
     "locals": {{k: repr(v) for k, v in _locals.items() if not k.startswith("_")}},
-    "final_deliverables": _final,
+    "final_answer": _final_answer,
+    "final_deliverables": _final_deliverables,
 }}, ensure_ascii=False))
 '''
     )
@@ -452,7 +465,11 @@ class DockerREPL(NonIsolatedEnv):
             **kwargs,
         )
 
-        self.deliverable_slots = normalize_slots(deliverable_slots)
+        # None -> content mode (``answer["content"]``); a list -> slot mode.
+        self._slot_mode = deliverable_slots is not None
+        self.deliverable_slots = (
+            normalize_slots(deliverable_slots) if self._slot_mode else None
+        )
         self.image = image
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn
@@ -592,8 +609,11 @@ class DockerREPL(NonIsolatedEnv):
         self.lm_handler_address = address
         if self.proxy_server is not None:
             self.proxy_server.lm_handler_address = address
-        seed = {name: "" for name in self.deliverable_slots}
-        self.execute_code(f"answer = {{'deliverables': {seed!r}, 'ready': False}}")
+        if self._slot_mode:
+            seed = {name: "" for name in self.deliverable_slots}
+            self.execute_code(f"answer = {{'deliverables': {seed!r}, 'ready': False}}")
+        else:
+            self.execute_code("answer = {'content': '', 'ready': False}")
 
     def add_context(
         self, context_payload: dict | list | str, context_index: int | None = None
@@ -727,6 +747,7 @@ class DockerREPL(NonIsolatedEnv):
                 locals=data.get("locals", {}),
                 execution_time=time.perf_counter() - start,
                 rlm_calls=calls,
+                final_answer=data.get("final_answer"),
                 final_deliverables=data.get("final_deliverables"),
             )
         except json.JSONDecodeError:
