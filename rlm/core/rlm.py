@@ -58,6 +58,20 @@ def _capture_root_usage(lm_handler) -> dict[str, int] | None:
         return None
 
 
+def _capture_finish_reason(lm_handler) -> str | None:
+    """Snapshot the last ROOT-model call's finish_reason from the default client.
+
+    Called right after the root completion. "length" means the turn was truncated at
+    the per-turn max_tokens (a wasted/empty iteration on reasoning turns); recording it
+    on the trajectory lets harnesses count truncated turns. Returns None if the client
+    does not expose it.
+    """
+    try:
+        return getattr(lm_handler.default_client, "last_finish_reason", None)
+    except Exception:
+        return None
+
+
 class RLM:
     """
     Recursive Language Model class that the user instantiates and runs on their tasks.
@@ -862,6 +876,7 @@ class RLM:
         # sub-calls (which go through a different client), so the trajectory records
         # root tokens per iteration and the run total is independently re-derivable.
         root_usage = _capture_root_usage(lm_handler)
+        finish_reason = _capture_finish_reason(lm_handler)
         code_block_strs = find_code_blocks(response)
         code_blocks = []
 
@@ -876,6 +891,7 @@ class RLM:
             code_blocks=code_blocks,
             iteration_time=iteration_time,
             root_usage=root_usage,
+            finish_reason=finish_reason,
         )
 
     def _default_answer(self, message_history: list[dict[str, Any]], lm_handler: LMHandler) -> str:
@@ -891,6 +907,7 @@ class RLM:
         ]
         response = lm_handler.completion(current_prompt)
         root_usage = _capture_root_usage(lm_handler)
+        finish_reason = _capture_finish_reason(lm_handler)
 
         if self.logger:
             self.logger.log(
@@ -900,6 +917,7 @@ class RLM:
                     final_answer=response,
                     code_blocks=[],
                     root_usage=root_usage,
+                    finish_reason=finish_reason,
                 )
             )
 

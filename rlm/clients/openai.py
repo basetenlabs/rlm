@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from collections import defaultdict
 from typing import Any
 
@@ -77,6 +78,29 @@ def _normalize_sampling_args(sampling_args: dict[str, Any], keep_max_tokens: boo
     return {k: v for k, v in args.items() if v is not None}
 
 
+def _note_finish_reason(response: Any) -> str | None:
+    """Read the completion's finish_reason and, when the turn was truncated at
+    max_tokens (``finish_reason == "length"``), print a visible stderr warning.
+
+    A "length" finish means the model hit the per-turn output cap BEFORE it
+    finished emitting content — on reasoning turns the reasoning alone can consume
+    the whole cap, leaving an empty ``content`` and a wasted iteration. Making it
+    non-silent lets operators see (and the harness count) truncated turns.
+    """
+    try:
+        finish_reason = response.choices[0].finish_reason
+    except Exception:
+        return None
+    if finish_reason == "length":
+        print(
+            "[rlm] WARN turn truncated at max_tokens (finish_reason=length) — "
+            "content may be empty",
+            file=sys.stderr,
+            flush=True,
+        )
+    return finish_reason
+
+
 def _merge_extra_body(
     hardcoded: dict[str, Any], sampling_args: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -136,6 +160,9 @@ class OpenAIClient(BaseLM):
         self.model_output_tokens: dict[str, int] = defaultdict(int)
         self.model_total_tokens: dict[str, int] = defaultdict(int)
         self.model_costs: dict[str, float] = defaultdict(float)  # Cost in USD
+        # finish_reason of the most recent completion (read per-turn by the RLM core so
+        # truncated turns can be recorded in the trajectory). None until the first call.
+        self.last_finish_reason: str | None = None
 
     def completion(self, prompt: str | list[dict[str, Any]], model: str | None = None) -> str:
         if isinstance(prompt, str):
@@ -163,6 +190,7 @@ class OpenAIClient(BaseLM):
                 keep_max_tokens="thinkingmachines" in str(self.base_url or "")),
         )
         self._track_cost(response, model)
+        self.last_finish_reason = _note_finish_reason(response)
         _maybe_dump_reasoning(response, model)
         return _strip_inline_thinking(response.choices[0].message.content)
 
@@ -194,6 +222,7 @@ class OpenAIClient(BaseLM):
                 keep_max_tokens="thinkingmachines" in str(self.base_url or "")),
         )
         self._track_cost(response, model)
+        self.last_finish_reason = _note_finish_reason(response)
         _maybe_dump_reasoning(response, model)
         return _strip_inline_thinking(response.choices[0].message.content)
 

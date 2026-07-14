@@ -251,6 +251,11 @@ class RLMIteration:
     # Sub-call usage lives in code_blocks[].result.rlm_calls[]; logging the root here makes the
     # run's total token count independently re-derivable from the trajectory.
     root_usage: dict[str, int] | None = None
+    # The ROOT completion's finish_reason for this turn (e.g. "stop", "length"). "length"
+    # means the turn was truncated at max_tokens BEFORE the model finished emitting content
+    # (on reasoning turns this often means an empty response); surfaced so harnesses can count
+    # truncated turns instead of the truncation being silent.
+    finish_reason: str | None = None
 
     def to_dict(self):
         return {
@@ -260,6 +265,7 @@ class RLMIteration:
             "final_answer": self.final_answer,
             "iteration_time": self.iteration_time,
             "root_usage": self.root_usage,
+            "finish_reason": self.finish_reason,
         }
 
 
