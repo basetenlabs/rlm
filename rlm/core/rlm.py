@@ -103,6 +103,8 @@ class RLM:
         repl_output_cap: int = 20000,
         nudge_on_no_code: bool = True,
         deliverable_slots: list[str] | None = None,
+        fabricate_final_answer: bool = True,
+        recover_stub: bool = True,
     ):
         """
         Args:
@@ -140,6 +142,19 @@ class RLM:
             on_subcall_complete: Callback fired when a child RLM completes. Args: (depth, model, duration, error_or_none).
             on_iteration_start: Callback fired when an iteration starts. Args: (depth, iteration_num).
             on_iteration_complete: Callback fired when an iteration completes. Args: (depth, iteration_num, duration).
+            fabricate_final_answer: When True (default, upstream behavior), running out of
+                iterations without the model finalizing triggers a final ``_default_answer``
+                LLM call that synthesizes a deliverable from the message history. When False,
+                skip that call and instead rescue only the model's own ``answer`` dict content
+                (empty when the model produced nothing) — an honest failure rather than a
+                fabricated deliverable. Set False for benchmarks where a manufactured answer
+                must not be graded as real work.
+            recover_stub: When True (default, upstream behavior), run ``_recover_if_stub`` on the
+                finalized answer at both the normal-finalize and iteration-exhaustion paths — a
+                heuristic that scans REPL string vars and substitutes the largest report-like one
+                when the finalized text looks like a stub. When False, use the finalized value
+                as-is (no largest-string grab), which avoids accidentally grabbing an input
+                document a model copied into a variable.
         """
         # Sampling args plumbed into backend_kwargs / other_backend_kwargs
         # before the clients are constructed, so they reach the chat-completions
@@ -235,6 +250,10 @@ class RLM:
         # (``answer["deliverables"]`` pre-seeded with one slot per filename).
         self.deliverable_slots = deliverable_slots
         self._slot_mode = deliverable_slots is not None
+        # Finalization fallback knobs (see __init__ docstring). Defaults preserve
+        # upstream behavior exactly.
+        self.fabricate_final_answer = fabricate_final_answer
+        self.recover_stub = recover_stub
         self.logger = logger
         self.verbose = VerbosePrinter(enabled=verbose)
 
@@ -510,11 +529,12 @@ class RLM:
 
                     if finalized:
                         if self._slot_mode:
-                            final_deliverables = self._recover_if_stub(
-                                final_deliverables, environment
-                            )
+                            if self.recover_stub:
+                                final_deliverables = self._recover_if_stub(
+                                    final_deliverables, environment
+                                )
                             final_answer = render_deliverables(final_deliverables)
-                        else:
+                        elif self.recover_stub:
                             final_answer = self._recover_if_stub(final_answer, environment)
                         time_end = time.perf_counter()
                         usage = lm_handler.get_usage_summary()
@@ -557,20 +577,41 @@ class RLM:
                 ) from None
 
             # Default behavior: we run out of iterations, provide one final answer.
-            # The model never finalized, so generate a fallback. In slot mode we
-            # fold that fallback into every deliverable slot (there is no way to
-            # know which slot it belongs to) and run stub-recovery per slot; in
-            # content mode we recover a single string.
+            # The model never finalized. When ``fabricate_final_answer`` (default),
+            # synthesize a fallback via a final LLM call (``_default_answer``); in
+            # slot mode fold it into every slot (there is no way to know which slot
+            # it belongs to), in content mode recover a single string. When
+            # ``fabricate_final_answer`` is False, make NO extra LLM call and NO
+            # largest-string grab: read the model's own ``answer`` dict from the
+            # environment, so a run that populated slots despite forgetting to set
+            # ``ready`` is rescued, and a run that produced nothing fails honestly
+            # (empty deliverable) rather than shipping a fabricated one.
             time_end = time.perf_counter()
-            fallback = self._default_answer(message_history, lm_handler)
-            if self._slot_mode:
-                slots = self._resolve_slots(environment)
-                final_deliverables = {name: fallback for name in slots}
-                final_deliverables = self._recover_if_stub(final_deliverables, environment)
-                final_answer = render_deliverables(final_deliverables)
+            if self.fabricate_final_answer:
+                fallback = self._default_answer(message_history, lm_handler)
+                if self._slot_mode:
+                    slots = self._resolve_slots(environment)
+                    final_deliverables = {name: fallback for name in slots}
+                    if self.recover_stub:
+                        final_deliverables = self._recover_if_stub(
+                            final_deliverables, environment
+                        )
+                    final_answer = render_deliverables(final_deliverables)
+                else:
+                    final_deliverables = None
+                    final_answer = fallback
+                    if self.recover_stub:
+                        final_answer = self._recover_if_stub(fallback, environment)
             else:
-                final_deliverables = None
-                final_answer = self._recover_if_stub(fallback, environment)
+                answer_obj = (getattr(environment, "locals", {}) or {}).get("answer") or {}
+                written = answer_obj.get("deliverables") or {}
+                if self._slot_mode:
+                    slots = self._resolve_slots(environment)
+                    final_deliverables = {name: (written.get(name) or "") for name in slots}
+                    final_answer = render_deliverables(final_deliverables)
+                else:
+                    final_deliverables = None
+                    final_answer = ""
             usage = lm_handler.get_usage_summary()
             self.verbose.print_final_answer(final_answer)
             self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
