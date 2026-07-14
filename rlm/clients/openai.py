@@ -101,6 +101,35 @@ def _note_finish_reason(response: Any) -> str | None:
     return finish_reason
 
 
+# Cap on reasoning_content captured per turn. Reasoning traces can be ~35K tokens
+# (~100K+ chars) on hard thinking-ON turns; keeping the full trace would bloat the
+# trajectory jsonl. Truncate to a readable-but-bounded window with a marker.
+REASONING_CAPTURE_CAP = 60000
+
+
+def _note_reasoning_content(response: Any) -> str | None:
+    """Read the served reasoning trace (``message.reasoning_content``) for this turn,
+    if present, and return it truncated to ``REASONING_CAPTURE_CAP`` chars so the
+    trajectory can record the model's thinking without exploding in size.
+
+    Served reasoning models (e.g. GLM with thinking enabled) return chain-of-thought
+    in ``reasoning_content``, separate from ``content``; it never reaches history.
+    Returns None when the field is absent/empty.
+    """
+    try:
+        reasoning = getattr(response.choices[0].message, "reasoning_content", None)
+    except Exception:
+        return None
+    if not reasoning:
+        return None
+    if len(reasoning) > REASONING_CAPTURE_CAP:
+        reasoning = (
+            reasoning[:REASONING_CAPTURE_CAP]
+            + f"\n…[reasoning truncated, {len(reasoning)} chars total]"
+        )
+    return reasoning
+
+
 def _merge_extra_body(
     hardcoded: dict[str, Any], sampling_args: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -163,6 +192,9 @@ class OpenAIClient(BaseLM):
         # finish_reason of the most recent completion (read per-turn by the RLM core so
         # truncated turns can be recorded in the trajectory). None until the first call.
         self.last_finish_reason: str | None = None
+        # Reasoning trace (thinking) of the most recent completion, truncated to
+        # REASONING_CAPTURE_CAP; captured per-turn into the trajectory. None until first call.
+        self.last_reasoning_content: str | None = None
 
     def completion(self, prompt: str | list[dict[str, Any]], model: str | None = None) -> str:
         if isinstance(prompt, str):
@@ -191,6 +223,7 @@ class OpenAIClient(BaseLM):
         )
         self._track_cost(response, model)
         self.last_finish_reason = _note_finish_reason(response)
+        self.last_reasoning_content = _note_reasoning_content(response)
         _maybe_dump_reasoning(response, model)
         return _strip_inline_thinking(response.choices[0].message.content)
 
@@ -223,6 +256,7 @@ class OpenAIClient(BaseLM):
         )
         self._track_cost(response, model)
         self.last_finish_reason = _note_finish_reason(response)
+        self.last_reasoning_content = _note_reasoning_content(response)
         _maybe_dump_reasoning(response, model)
         return _strip_inline_thinking(response.choices[0].message.content)
 

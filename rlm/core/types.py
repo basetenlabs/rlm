@@ -256,6 +256,10 @@ class RLMIteration:
     # (on reasoning turns this often means an empty response); surfaced so harnesses can count
     # truncated turns instead of the truncation being silent.
     finish_reason: str | None = None
+    # The ROOT model's reasoning trace (thinking) for this turn, if the served model returns a
+    # separate reasoning_content field (e.g. GLM with thinking ON). Truncated by the client to a
+    # bounded size. None when the model doesn't emit reasoning or thinking is off.
+    reasoning_content: str | None = None
 
     def to_dict(self):
         return {
@@ -266,6 +270,7 @@ class RLMIteration:
             "iteration_time": self.iteration_time,
             "root_usage": self.root_usage,
             "finish_reason": self.finish_reason,
+            "reasoning_content": self.reasoning_content,
         }
 
 

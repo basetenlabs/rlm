@@ -72,6 +72,17 @@ def _capture_finish_reason(lm_handler) -> str | None:
         return None
 
 
+def _capture_reasoning_content(lm_handler) -> str | None:
+    """Snapshot the last ROOT-model call's reasoning trace (thinking) from the default
+    client. Called right after the root completion. The client truncates it to a bounded
+    size before storing. Returns None if the client does not expose it (e.g. thinking off).
+    """
+    try:
+        return getattr(lm_handler.default_client, "last_reasoning_content", None)
+    except Exception:
+        return None
+
+
 class RLM:
     """
     Recursive Language Model class that the user instantiates and runs on their tasks.
@@ -877,6 +888,7 @@ class RLM:
         # root tokens per iteration and the run total is independently re-derivable.
         root_usage = _capture_root_usage(lm_handler)
         finish_reason = _capture_finish_reason(lm_handler)
+        reasoning_content = _capture_reasoning_content(lm_handler)
         code_block_strs = find_code_blocks(response)
         code_blocks = []
 
@@ -892,6 +904,7 @@ class RLM:
             iteration_time=iteration_time,
             root_usage=root_usage,
             finish_reason=finish_reason,
+            reasoning_content=reasoning_content,
         )
 
     def _default_answer(self, message_history: list[dict[str, Any]], lm_handler: LMHandler) -> str:
@@ -908,6 +921,7 @@ class RLM:
         response = lm_handler.completion(current_prompt)
         root_usage = _capture_root_usage(lm_handler)
         finish_reason = _capture_finish_reason(lm_handler)
+        reasoning_content = _capture_reasoning_content(lm_handler)
 
         if self.logger:
             self.logger.log(
@@ -918,6 +932,7 @@ class RLM:
                     code_blocks=[],
                     root_usage=root_usage,
                     finish_reason=finish_reason,
+                    reasoning_content=reasoning_content,
                 )
             )
 
