@@ -15,16 +15,37 @@ ClientBackend = Literal[
 EnvironmentType = Literal["local", "ipython", "docker", "modal", "prime", "daytona", "e2b"]
 
 
-def _serialize_value(value: Any) -> Any:
-    """Convert a value to a JSON-serializable representation."""
+def _serialize_value(value: Any, _seen: set[int] | None = None) -> Any:
+    """Convert a value to a JSON-serializable representation.
+
+    REPL locals are arbitrary user-created Python objects and may contain
+    cycles.  Logging must not abort an otherwise healthy completion merely
+    because a dict or list refers to itself.
+    """
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, ModuleType):
         return f"<module '{value.__name__}'>"
+    if _seen is None:
+        _seen = set()
     if isinstance(value, (list, tuple)):
-        return [_serialize_value(v) for v in value]
+        identity = id(value)
+        if identity in _seen:
+            return f"<recursive {type(value).__name__}>"
+        _seen.add(identity)
+        try:
+            return [_serialize_value(v, _seen) for v in value]
+        finally:
+            _seen.remove(identity)
     if isinstance(value, dict):
-        return {str(k): _serialize_value(v) for k, v in value.items()}
+        identity = id(value)
+        if identity in _seen:
+            return "<recursive dict>"
+        _seen.add(identity)
+        try:
+            return {str(k): _serialize_value(v, _seen) for k, v in value.items()}
+        finally:
+            _seen.remove(identity)
     if callable(value):
         return f"<{type(value).__name__} '{getattr(value, '__name__', repr(value))}'>"
     # Try to convert to string for other types

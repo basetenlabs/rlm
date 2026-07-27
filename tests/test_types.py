@@ -31,6 +31,22 @@ class TestSerializeValue:
         result = _serialize_value({"a": 1, "b": 2})
         assert result == {"a": 1, "b": 2}
 
+    def test_recursive_dict_does_not_crash_logger(self):
+        value = {"name": "cycle"}
+        value["self"] = value
+
+        result = _serialize_value(value)
+
+        assert result == {"name": "cycle", "self": "<recursive dict>"}
+
+    def test_recursive_list_does_not_crash_logger(self):
+        value = ["cycle"]
+        value.append(value)
+
+        result = _serialize_value(value)
+
+        assert result == ["cycle", "<recursive list>"]
+
     def test_callable(self):
         def my_func():
             pass
