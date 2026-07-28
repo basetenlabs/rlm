@@ -13,7 +13,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from typing import Any
 
-from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
+from rlm.core.comms_utils import (
+    DEFAULT_WAVE_TIMEOUT,
+    WAVE_TIMEOUT_SLACK,
+    LMRequest,
+    send_lm_request,
+    send_lm_request_batched,
+)
 from rlm.core.types import DEFAULT_DELIVERABLE_SLOT, REPLResult, RLMChatCompletion
 from rlm.environments.base_env import (
     RESERVED_TOOL_NAMES,
@@ -347,7 +353,8 @@ class LocalREPL(NonIsolatedEnv):
             return ["Error: No LM handler configured"] * len(prompts)
         try:
             responses = send_lm_request_batched(
-                self.lm_handler_address, prompts, model=model, depth=self.depth
+                self.lm_handler_address, prompts, model=model, depth=self.depth,
+                timeout=int(DEFAULT_WAVE_TIMEOUT + WAVE_TIMEOUT_SLACK),
             )
 
             results = []

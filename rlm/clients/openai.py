@@ -1,9 +1,11 @@
 import json
 import os
+import socket
 import sys
 from collections import defaultdict
 from typing import Any
 
+import httpx
 import openai
 from dotenv import load_dotenv
 
@@ -18,6 +20,17 @@ DEFAULT_OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DEFAULT_VERCEL_API_KEY = os.getenv("AI_GATEWAY_API_KEY")
 DEFAULT_PRIME_API_KEY = os.getenv("PRIME_API_KEY")
 DEFAULT_PRIME_INTELLECT_BASE_URL = "https://api.pinference.ai/api/v1/"
+
+# SO_KEEPALIVE is portable; the TCP_KEEP* tuning knobs are Linux-only, so guard
+# them for macOS dev machines. 60s idle + 3 probes 10s apart ≈ dead peer
+# detected within ~2 minutes.
+_KEEPALIVE_SOCKET_OPTIONS: list[tuple[int, int, int]] = [
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+] + [
+    (socket.IPPROTO_TCP, getattr(socket, name), val)
+    for name, val in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3))
+    if hasattr(socket, name)
+]
 
 
 def _strip_inline_thinking(content: str | None) -> str:
@@ -178,8 +191,29 @@ class OpenAIClient(BaseLM):
             "timeout": self.timeout,
             **{k: v for k, v in self.kwargs.items() if k != "model_name"},
         }
-        self.client = openai.OpenAI(**client_kwargs)
-        self.async_client = openai.AsyncOpenAI(**client_kwargs)
+        if "http_client" in client_kwargs:
+            self.client = openai.OpenAI(**client_kwargs)
+            self.async_client = openai.AsyncOpenAI(**client_kwargs)
+        else:
+            # TCP keepalives so the kernel detects a silently severed connection
+            # (NAT/conntrack flush, gateway restart) in ~90s and fails the request
+            # instead of waiting forever on a dead socket.
+            self.client = openai.OpenAI(
+                **client_kwargs,
+                http_client=httpx.Client(
+                    transport=httpx.HTTPTransport(
+                        socket_options=_KEEPALIVE_SOCKET_OPTIONS),
+                    timeout=self.timeout,
+                ),
+            )
+            self.async_client = openai.AsyncOpenAI(
+                **client_kwargs,
+                http_client=httpx.AsyncClient(
+                    transport=httpx.AsyncHTTPTransport(
+                        socket_options=_KEEPALIVE_SOCKET_OPTIONS),
+                    timeout=self.timeout,
+                ),
+            )
         self.model_name = model_name
         self.base_url = base_url  # Track for cost extraction
 

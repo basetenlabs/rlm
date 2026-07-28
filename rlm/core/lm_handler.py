@@ -10,7 +10,13 @@ from socketserver import StreamRequestHandler, ThreadingTCPServer
 from threading import Thread
 
 from rlm.clients.base_lm import BaseLM
-from rlm.core.comms_utils import LMRequest, LMResponse, socket_recv, socket_send
+from rlm.core.comms_utils import (
+    DEFAULT_WAVE_TIMEOUT,
+    LMRequest,
+    LMResponse,
+    socket_recv,
+    socket_send,
+)
 from rlm.core.types import ModelUsageSummary, RLMChatCompletion, UsageSummary
 
 
@@ -109,7 +115,20 @@ class LMRequestHandler(StreamRequestHandler):
             # batch; failures are surfaced per-prompt as error completions below.
             return await asyncio.gather(*tasks, return_exceptions=True)
 
-        results = asyncio.run(run_all())
+        # Hard wave deadline: a severed provider connection can otherwise park
+        # the gather forever (all awaits suspended, nothing on the wire). On
+        # timeout every prompt gets an error completion, which the REPL surfaces
+        # to the root as retryable "Error: ..." strings.
+        try:
+            results = asyncio.run(
+                asyncio.wait_for(run_all(), timeout=DEFAULT_WAVE_TIMEOUT)
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            err = TimeoutError(
+                f"batched wave exceeded RLM_WAVE_TIMEOUT={DEFAULT_WAVE_TIMEOUT:.0f}s "
+                "(wedged provider connections?)"
+            )
+            results = [err] * len(request.prompts)
         end_time = time.perf_counter()
         total_time = end_time - start_time
 

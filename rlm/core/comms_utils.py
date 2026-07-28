@@ -6,12 +6,23 @@ Used for communication between LMHandler and environment subprocesses.
 """
 
 import json
+import os
 import socket
 import struct
 from dataclasses import dataclass
 from typing import Any
 
 from rlm.core.types import RLMChatCompletion
+
+# End-to-end deadline for one batched subcall wave, enforced handler-side via
+# asyncio.wait_for and mirrored (+ slack) as the REPL's socket timeout. Without
+# it a silently-severed provider connection wedges the wave forever — the
+# 2026-07-28 incident where all five concurrent runs hung with zero open
+# connections after a node network blip.
+DEFAULT_WAVE_TIMEOUT: float = float(os.environ.get("RLM_WAVE_TIMEOUT", "2700"))
+# Socket-timeout slack the wave client adds over the handler deadline, so the
+# handler's own timeout error always arrives before the socket gives up.
+WAVE_TIMEOUT_SLACK: float = 120.0
 
 # =============================================================================
 # Message Dataclasses
