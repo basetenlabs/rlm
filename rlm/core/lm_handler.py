@@ -278,17 +278,35 @@ class LMHandler:
         return False
 
     def get_usage_summary(self) -> UsageSummary:
-        """Get the usage summary for all clients, merged into a single dict."""
-        merged = {}
-        # Include default client
-        default_summary = self.default_client.get_usage_summary()
-        merged.update(default_summary.model_usage_summaries)
-        # Include other backend client if it exists
-        if self.other_backend_client is not None:
-            other_summary = self.other_backend_client.get_usage_summary()
-            merged.update(other_summary.model_usage_summaries)
-        # Include all registered clients
-        for client in self.clients.values():
-            client_summary = client.get_usage_summary()
-            merged.update(client_summary.model_usage_summaries)
+        """Get the usage summary for all clients, merged into a single dict.
+
+        Distinct clients may serve the same model name (e.g. a root and a
+        depth-1 sub backend that differ only in sampling args), so a plain
+        dict.update() keyed by model name would drop one side's usage.
+        Deduplicate by client identity (the same client can appear both as
+        default_client and registered in ``clients``), then sum per name.
+        """
+        unique_clients: list[BaseLM] = []
+        seen: set[int] = set()
+        for candidate in (self.default_client, self.other_backend_client,
+                          *self.clients.values()):
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            unique_clients.append(candidate)
+
+        merged: dict[str, ModelUsageSummary] = {}
+        for client in unique_clients:
+            for name, s in client.get_usage_summary().model_usage_summaries.items():
+                prev = merged.get(name)
+                if prev is None:
+                    merged[name] = s
+                    continue
+                costs = [c for c in (prev.total_cost, s.total_cost) if c is not None]
+                merged[name] = ModelUsageSummary(
+                    total_calls=prev.total_calls + s.total_calls,
+                    total_input_tokens=prev.total_input_tokens + s.total_input_tokens,
+                    total_output_tokens=prev.total_output_tokens + s.total_output_tokens,
+                    total_cost=sum(costs) if costs else None,
+                )
         return UsageSummary(model_usage_summaries=merged)
