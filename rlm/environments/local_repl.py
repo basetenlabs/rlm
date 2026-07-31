@@ -222,7 +222,14 @@ class LocalREPL(NonIsolatedEnv):
         )
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn  # Callback for recursive RLM calls (depth > 1 support)
-        self.original_cwd = os.getcwd()
+        # os.getcwd() raises FileNotFoundError when another concurrent LocalREPL's
+        # cleanup() has rmtree'd the directory this process is standing in (chdir is
+        # process-global; see _temp_cwd/cleanup). Fall back so init never wedges.
+        try:
+            self.original_cwd = os.getcwd()
+        except FileNotFoundError:
+            self.original_cwd = tempfile.gettempdir()
+            os.chdir(self.original_cwd)
         self.temp_dir = tempfile.mkdtemp(prefix=f"repl_env_{uuid.uuid4()}_")
         self._lock = threading.Lock()
         self._context_count: int = 0
@@ -562,13 +569,27 @@ class LocalREPL(NonIsolatedEnv):
 
     @contextmanager
     def _temp_cwd(self):
-        """Temporarily change to temp directory for execution."""
-        old_cwd = os.getcwd()
+        """Temporarily change to temp directory for execution.
+
+        chdir is process-global and multiple LocalREPLs run concurrently in one
+        process, so both the saved cwd and the restore target can be deleted by a
+        sibling's cleanup() at any await point. Never let that propagate — restore
+        to the safest still-existing directory instead.
+        """
+        try:
+            old_cwd = os.getcwd()
+        except FileNotFoundError:
+            old_cwd = self.original_cwd
         try:
             os.chdir(self.temp_dir)
             yield
         finally:
-            os.chdir(old_cwd)
+            for target in (old_cwd, self.original_cwd, tempfile.gettempdir()):
+                try:
+                    os.chdir(target)
+                    break
+                except FileNotFoundError:
+                    continue
 
     def _restore_scaffold(self) -> None:
         """Restore scaffold names after execution so overwrites (e.g. context = 'x') don't persist."""
@@ -661,6 +682,21 @@ class LocalREPL(NonIsolatedEnv):
     def cleanup(self):
         """Clean up temp directory and reset state."""
         try:
+            # If the process is currently standing in (or under) our temp_dir —
+            # possible because a sibling REPL's _temp_cwd restore can land here —
+            # step out before deleting it, or every later os.getcwd() in this
+            # process raises FileNotFoundError and all new episodes wedge.
+            try:
+                cwd = os.getcwd()
+            except FileNotFoundError:
+                cwd = None
+            if cwd is not None and (cwd == self.temp_dir or cwd.startswith(self.temp_dir + os.sep)):
+                for target in (self.original_cwd, tempfile.gettempdir()):
+                    try:
+                        os.chdir(target)
+                        break
+                    except FileNotFoundError:
+                        continue
             shutil.rmtree(self.temp_dir)
         except Exception:
             pass
