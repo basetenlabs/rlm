@@ -170,8 +170,16 @@ class SubLLMProxy:
 
         if handle.fake_query_batched is not None:
             try:
-                result = handle.fake_query_batched(list(prompts), handle.state_ref)
-                responses = await _maybe_await(result)
+                if inspect.iscoroutinefunction(handle.fake_query_batched):
+                    responses = await handle.fake_query_batched(list(prompts), handle.state_ref)
+                else:
+                    # Sync fake_query fns block for minutes on remote HTTP; run off-loop
+                    # or every other rollout's proxy connection starves and dies with
+                    # "Connection closed before message complete".
+                    result = await asyncio.to_thread(
+                        handle.fake_query_batched, list(prompts), handle.state_ref
+                    )
+                    responses = await _maybe_await(result)
             except Exception as e:  # noqa: BLE001
                 logger.exception("fake_query_batched failed")
                 return web.json_response({"error": str(e)})
@@ -217,8 +225,12 @@ class SubLLMProxy:
     ) -> tuple[str, dict[str, Any]]:
         if handle.fake_query is not None:
             prompt_text = _flatten_prompt(prompt)
-            result = handle.fake_query(prompt_text, handle.state_ref)
-            content = await _maybe_await(result)
+            if inspect.iscoroutinefunction(handle.fake_query):
+                content = await handle.fake_query(prompt_text, handle.state_ref)
+            else:
+                # Same event-loop-starvation hazard as fake_query_batched above.
+                result = await asyncio.to_thread(handle.fake_query, prompt_text, handle.state_ref)
+                content = await _maybe_await(result)
             if content is not None:
                 return (content if isinstance(content, str) else str(content)), {}
 
