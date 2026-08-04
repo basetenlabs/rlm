@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -26,6 +28,15 @@ from rlm_train.rubric import RLMTrainRubric
 logger = logging.getLogger(__name__)
 
 _MAX_REPL_OUTPUT_CHARS = 20_000
+
+#: Per-rollout phase timing (HARVEY_RL_TIMING=1). Accumulated in ``state["rlm_timing"]``:
+#:   root_wait_s — wall between returning a prompt and its completed step arriving
+#:                 (root decode + orchestrator transport), summed over turns
+#:   repl_exec_s — wall inside backend.execute (REPL cells INCLUDING blocking sub-calls)
+#:   n_cells     — executed code cells
+#: A downstream rubric merges this into scores.json so timing correlates with
+#: turns / deliverable size / reward per rollout.
+_TIMING = os.environ.get("HARVEY_RL_TIMING") == "1"
 
 
 class RLMTrainEnv(vf.MultiTurnEnv):
@@ -161,7 +172,22 @@ class RLMTrainEnv(vf.MultiTurnEnv):
         state["prompt"] = list(state["rlm_history"])
 
     async def get_prompt_messages(self, state: State) -> Messages:
+        if _TIMING:
+            _now = time.monotonic()
+            timing = state.setdefault(
+                "rlm_timing",
+                # t0/turn_ts are ABSOLUTE epoch times so phases can be aligned with
+                # external events (endpoint saturation, replica changes, other runs).
+                {"root_wait_s": 0.0, "repl_exec_s": 0.0, "n_cells": 0,
+                 "t0": time.time(), "turn_ts": []},
+            )
+            t_ret = state.get("_rlm_t_prompt_returned")
+            if t_ret is not None and len(state["trajectory"]) > int(state.get("rlm_n_processed") or 0):
+                timing["root_wait_s"] += _now - t_ret
+                timing["turn_ts"].append(round(time.time(), 3))
         if not state["trajectory"]:
+            if _TIMING:
+                state["_rlm_t_prompt_returned"] = time.monotonic()
             return list(state["prompt"])
 
         history: list = state["rlm_history"]
@@ -177,9 +203,14 @@ class RLMTrainEnv(vf.MultiTurnEnv):
             outputs: list[dict[str, Any]] = []
             final_from_answer: str | None = None
             for code in find_code_blocks(assistant_text):
+                if _TIMING:
+                    _t_exec = time.monotonic()
                 try:
                     result = await backend.execute(code)
                 except Exception as e:  # noqa: BLE001
+                    if _TIMING:
+                        timing["repl_exec_s"] += time.monotonic() - _t_exec
+                        timing["n_cells"] += 1
                     outputs.append(
                         {
                             "code": code,
@@ -190,6 +221,10 @@ class RLMTrainEnv(vf.MultiTurnEnv):
                         }
                     )
                     continue
+                else:
+                    if _TIMING:
+                        timing["repl_exec_s"] += time.monotonic() - _t_exec
+                        timing["n_cells"] += 1
                 outputs.append(_pack_exec(code, result))
                 state["rlm_repl_calls"] = int(state.get("rlm_repl_calls") or 0) + 1
                 if result.final_answer is not None and final_from_answer is None:
@@ -216,6 +251,8 @@ class RLMTrainEnv(vf.MultiTurnEnv):
             history_count=0,
         )
         history.append(user_iter)
+        if _TIMING:
+            state["_rlm_t_prompt_returned"] = time.monotonic()
         return _normalize_for_api(history)
 
     async def env_response(self, messages: Messages, state: State, **kwargs: Any) -> Messages | str:
