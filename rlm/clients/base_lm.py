@@ -1,10 +1,15 @@
+import os
 from abc import ABC, abstractmethod
 from typing import Any
 
 from rlm.core.types import ModelUsageSummary, UsageSummary
 
-# Default timeout for LM API calls (in seconds)
-DEFAULT_TIMEOUT: float = 300.0
+# Default timeout for LM API calls (in seconds). Overridable via
+# RLM_API_TIMEOUT: agentic roots at temperature 1.0 with thinking enabled
+# legitimately exceed 300s on 100K+-token turns (vLLM prefill + long
+# reasoning), and the openai client's silent retries turn one timeout into
+# ~15 lost minutes before the harness fails the room.
+DEFAULT_TIMEOUT: float = float(os.environ.get("RLM_API_TIMEOUT", "300"))
 
 
 class BaseLM(ABC):
