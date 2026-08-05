@@ -65,11 +65,23 @@ class LMRequestHandler(StreamRequestHandler):
             return False
 
     def _handle_single(self, request: LMRequest, handler: "LMHandler") -> LMResponse:
-        """Handle a single prompt request."""
+        """Handle a single prompt request.
+
+        Failures return an ``error_response`` (surfaced to the model as
+        ``"Error: llm() call failed - <reason>"``, matching the batched path)
+        rather than raising: an uncaught exception here killed the handler
+        thread BEFORE any reply was sent, so the caller's ``llm_query`` blocked
+        on a socket that would never answer — the model's cell then died on the
+        REPL cell-timeout with no mention of the sub-call at all (found
+        2026-08-05; the batched path always had per-prompt error strings).
+        """
         client = handler.get_client(request.model, request.depth)
 
         start_time = time.perf_counter()
-        content = client.completion(request.prompt)
+        try:
+            content = client.completion(request.prompt)
+        except Exception as e:  # noqa: BLE001 — reason must reach the model in-band
+            return LMResponse.error_response(f"llm() call failed - {e}")
         end_time = time.perf_counter()
 
         model_usage = client.get_last_usage()
