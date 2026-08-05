@@ -50,6 +50,7 @@ class RLMTrainEnv(vf.MultiTurnEnv):
         custom_system_prompt: str | None = None,
         deliverable_slots: list[str] | None = None,
         max_timeout: float | None = None,
+        repl_output_cap: int = _MAX_REPL_OUTPUT_CHARS,
         rubric: vf.Rubric | None = None,
         sub_llm_fn: Callable[[str, Any], Any] | None = None,
         sub_llm_fn_batched: Callable[[list[str], Any], Any] | None = None,
@@ -73,6 +74,9 @@ class RLMTrainEnv(vf.MultiTurnEnv):
         # pre-2026-08-05 behavior: RL episodes had no wall bound at all until
         # the first weight update enabled staleness cancellation.
         self._max_timeout = max_timeout
+        # Per-block REPL output cap fed back to the root — same semantics as
+        # RLM.repl_output_cap (spec.repl_output_cap upstream of both).
+        self._repl_output_cap = repl_output_cap
         self._sub_model = sub_model
         self._sub_sampling_args = sub_sampling_args or {"max_tokens": 4096}
         # SHARED protocol→prompt selection (rlm.utils.prompts.select_system_prompt),
@@ -256,15 +260,16 @@ class RLMTrainEnv(vf.MultiTurnEnv):
                 if result.final_answer is not None and final_from_answer is None:
                     final_from_answer = result.final_answer
 
-            repl_msgs = _format_repl_outputs(outputs)
+            # No-code feedback arrives BY CONSTRUCTION via render_turn_feedback
+            # (empty bodies -> the corrective message), same as eval's loop —
+            # not injected ad hoc here, so it cannot be forgotten again.
+            repl_msgs = _format_repl_outputs(
+                outputs,
+                self._repl_output_cap,
+                no_code_feedback=NO_CODE_FEEDBACK if final_from_answer is None else None,
+            )
             history.append(assistant_msg)
             history.extend(repl_msgs)
-            if not outputs and final_from_answer is None:
-                # No parseable code block: without corrective signal the model
-                # pattern-locks on its own prior turn and burns the whole budget
-                # (L25 transcripts: 79/79 turns of unexecuted code). Same
-                # feedback the eval loop uses.
-                history.append({"role": "user", "content": NO_CODE_FEEDBACK})
             state["rlm_n_processed"] = n_processed + 1
             state["rlm_iterations"] = n_processed + 1
             n_processed += 1
@@ -376,29 +381,20 @@ def _pack_exec(code: str, result: ExecResult) -> dict[str, Any]:
     }
 
 
-def _format_repl_outputs(outputs: list[dict[str, Any]]) -> list[dict[str, str]]:
-    if not outputs:
-        return []
-    parts: list[str] = []
-    multi = len(outputs) > 1
-    for i, o in enumerate(outputs):
-        body = _format_one(o)
-        header = f"REPL output (block {i + 1}):" if multi else "REPL output:"
-        parts.append(f"{header}\n{body}")
-    return [{"role": "user", "content": "\n\n".join(parts)}]
+def _format_repl_outputs(
+    outputs: list[dict[str, Any]],
+    output_cap: int,
+    no_code_feedback: str | None = None,
+) -> list[dict[str, str]]:
+    """Render one turn's exec results via the SHARED renderers
+    (``rlm.utils.parsing.render_block_output`` / ``render_turn_feedback``) —
+    this used to be a hand-mirrored copy of ``format_iteration``'s rendering
+    with a hardcoded 20K cap where eval's is spec-configurable."""
+    from rlm.utils.parsing import render_block_output, render_turn_feedback
 
-
-def _format_one(o: dict[str, Any]) -> str:
-    parts: list[str] = []
-    if o.get("stdout"):
-        parts.append(f"\n{o['stdout']}")
-    if o.get("stderr"):
-        parts.append(f"\n{o['stderr']}")
-    if o.get("locals_keys"):
-        parts.append(f"REPL variables: {list(o['locals_keys'])}\n")
-    body = "\n\n".join(parts) if parts else "No output"
-    if len(body) > _MAX_REPL_OUTPUT_CHARS:
-        body = (
-            body[:_MAX_REPL_OUTPUT_CHARS] + f"... + [{len(body) - _MAX_REPL_OUTPUT_CHARS} chars...]"
-        )
-    return body
+    bodies = [
+        render_block_output(o.get("stdout"), o.get("stderr"), o.get("locals_keys"), output_cap)
+        for o in outputs
+    ]
+    reply = render_turn_feedback(bodies, no_code_feedback)
+    return [{"role": "user", "content": reply}] if reply is not None else []

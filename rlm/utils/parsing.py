@@ -46,6 +46,55 @@ NO_CODE_FEEDBACK = (
 )
 
 
+def render_block_output(
+    stdout: str | None,
+    stderr: str | None,
+    locals_keys: list[str] | None,
+    output_cap: int,
+) -> str:
+    """THE per-code-block REPL-output rendering, shared by every RLM loop.
+
+    Extracted 2026-08-05: the eval loop (``format_execution_result``) and the
+    RL loop (``rlm_train.env._format_one``) carried byte-identical copies of
+    this — except the RL copy hardcoded a 20,000-char cap while eval's is
+    configurable (``repl_output_cap``, raised for direct-read roots), a live
+    divergence waiting to matter.
+    """
+    parts: list[str] = []
+    if stdout:
+        parts.append(f"\n{stdout}")
+    if stderr:
+        parts.append(f"\n{stderr}")
+    if locals_keys:
+        parts.append(f"REPL variables: {list(locals_keys)}\n")
+    body = "\n\n".join(parts) if parts else "No output"
+    if len(body) > output_cap:
+        body = body[:output_cap] + f"... + [{len(body) - output_cap} chars...]"
+    return body
+
+
+def render_turn_feedback(
+    block_bodies: list[str],
+    no_code_feedback: str | None = None,
+) -> str | None:
+    """THE combined user-reply text for one turn's executed blocks.
+
+    Headers + joining shared by both loops. Empty ``block_bodies`` (the turn
+    parsed no code) returns ``no_code_feedback`` — so a loop that renders its
+    feedback through here gets the no-code corrective signal by construction
+    rather than by remembering to add it (the RL loop forgot once; 79-turn
+    silent churn). Returns None when there is nothing to say.
+    """
+    if not block_bodies:
+        return no_code_feedback
+    multi = len(block_bodies) > 1
+    parts = [
+        f"{'REPL output (block %d):' % (i + 1) if multi else 'REPL output:'}\n{body}"
+        for i, body in enumerate(block_bodies)
+    ]
+    return "\n\n".join(parts)
+
+
 def format_iteration(
     iteration: RLMIteration,
     max_character_length: int = 20000,
@@ -82,23 +131,30 @@ def format_iteration(
     """
     messages = [{"role": "assistant", "content": iteration.response}]
 
-    parts = []
-    multi = len(iteration.code_blocks) > 1
-    for i, code_block in enumerate(iteration.code_blocks):
-        result = format_execution_result(code_block.result)
-        if len(result) > max_character_length:
-            result = (
-                result[:max_character_length]
-                + f"... + [{len(result) - max_character_length} chars...]"
-            )
-        header = f"REPL output (block {i + 1}):" if multi else "REPL output:"
-        parts.append(f"{header}\n{result}")
-
-    if parts:
-        messages.append({"role": "user", "content": "\n\n".join(parts)})
-    elif no_code_feedback:
-        messages.append({"role": "user", "content": no_code_feedback})
+    bodies = [
+        render_block_output(
+            code_block.result.stdout,
+            code_block.result.stderr,
+            _important_locals(code_block.result),
+            max_character_length,
+        )
+        for code_block in iteration.code_blocks
+    ]
+    reply = render_turn_feedback(bodies, no_code_feedback)
+    if reply is not None:
+        messages.append({"role": "user", "content": reply})
     return messages
+
+
+def _important_locals(result: REPLResult) -> list[str]:
+    """User-meaningful REPL variable names (simple types, non-dunder)."""
+    keys: list[str] = []
+    for key, value in result.locals.items():
+        if key.startswith("_") or key in ("__builtins__", "__name__", "__doc__"):
+            continue
+        if isinstance(value, (str, int, float, bool, list, dict, tuple)):
+            keys.append(key)
+    return keys
 
 
 ################
@@ -107,36 +163,16 @@ def format_iteration(
 
 
 def format_execution_result(result: REPLResult) -> str:
+    """Format one execution result for display (uncapped).
+
+    Thin wrapper over :func:`render_block_output` — the shared renderer both
+    loops use — kept for existing callers.
     """
-    Format the execution result as a string for display.
+    import sys
 
-    Args:
-        result: The REPLResult object to format.
-    """
-    result_parts = []
-
-    if result.stdout:
-        result_parts.append(f"\n{result.stdout}")
-
-    if result.stderr:
-        result_parts.append(f"\n{result.stderr}")
-
-    # Show some key variables (excluding internal ones)
-    important_vars = {}
-    for key, value in result.locals.items():
-        if not key.startswith("_") and key not in [
-            "__builtins__",
-            "__name__",
-            "__doc__",
-        ]:
-            # Only show simple types or short representations
-            if isinstance(value, (str, int, float, bool, list, dict, tuple)):
-                important_vars[key] = ""
-
-    if important_vars:
-        result_parts.append(f"REPL variables: {list(important_vars.keys())}\n")
-
-    return "\n\n".join(result_parts) if result_parts else "No output"
+    return render_block_output(
+        result.stdout, result.stderr, _important_locals(result), sys.maxsize
+    )
 
 
 def convert_context_for_repl(context):
