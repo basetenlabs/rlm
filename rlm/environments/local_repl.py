@@ -93,6 +93,66 @@ class _AnswerDict(dict):
 # =============================================================================
 
 # Safe builtins - blocks dangerous operations like eval/exec/input
+class _ThreadRoutedStream(io.TextIOBase):
+    """A process-wide stdout/stderr proxy that routes writes per-thread.
+
+    Each REPL cell registers a buffer for ITS exec thread; writes from any
+    unregistered thread pass through to the real stream. This is what makes
+    concurrent LocalREPLs in one process safe — see ``_capture_output``.
+    """
+
+    def __init__(self, fallback: Any) -> None:
+        self._fallback = fallback
+        self._routes: dict[int, Any] = {}
+        self._routes_lock = threading.Lock()
+
+    def register(self, buf: Any) -> None:
+        with self._routes_lock:
+            self._routes[threading.get_ident()] = buf
+
+    def unregister(self) -> None:
+        with self._routes_lock:
+            self._routes.pop(threading.get_ident(), None)
+
+    def _target(self) -> Any:
+        return self._routes.get(threading.get_ident(), self._fallback)
+
+    def write(self, s: str) -> int:
+        return self._target().write(s)
+
+    def flush(self) -> None:
+        target = self._target()
+        flush = getattr(target, "flush", None)
+        if flush is not None:
+            flush()
+
+    def writable(self) -> bool:
+        return True
+
+    def isatty(self) -> bool:
+        return False
+
+    @property
+    def encoding(self) -> str:  # some libraries introspect this
+        return getattr(self._fallback, "encoding", "utf-8") or "utf-8"
+
+
+_STREAM_ROUTERS: tuple[_ThreadRoutedStream, _ThreadRoutedStream] | None = None
+_STREAM_ROUTERS_LOCK = threading.Lock()
+
+
+def _install_stream_routers() -> tuple[_ThreadRoutedStream, _ThreadRoutedStream]:
+    """Idempotently replace sys.stdout/sys.stderr with thread-routing proxies."""
+    global _STREAM_ROUTERS
+    with _STREAM_ROUTERS_LOCK:
+        if _STREAM_ROUTERS is None:
+            out = _ThreadRoutedStream(sys.stdout)
+            err = _ThreadRoutedStream(sys.stderr)
+            sys.stdout, sys.stderr = out, err
+            _STREAM_ROUTERS = (out, err)
+    return _STREAM_ROUTERS
+
+
 _SAFE_BUILTINS = {
     # Core types and functions
     "print": print,
@@ -557,15 +617,31 @@ class LocalREPL(NonIsolatedEnv):
 
     @contextmanager
     def _capture_output(self):
-        """Thread-safe context manager to capture stdout/stderr."""
-        with self._lock:
-            old_stdout, old_stderr = sys.stdout, sys.stderr
-            stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
-            try:
-                sys.stdout, sys.stderr = stdout_buf, stderr_buf
-                yield stdout_buf, stderr_buf
-            finally:
-                sys.stdout, sys.stderr = old_stdout, old_stderr
+        """Capture THIS thread's stdout/stderr for the duration of a cell.
+
+        ``sys.stdout`` is process-global, and multiple LocalREPLs execute
+        cells concurrently on different threads (RL env workers run 2+
+        rollouts per process). The old implementation swapped ``sys.stdout``
+        under a per-INSTANCE lock, so concurrent cells captured EACH OTHER'S
+        prints — rollout A received rollout B's output as its own REPL
+        feedback (cross-rollout leakage, root-caused 2026-08-05 after
+        masquerading as sub-LLM response misrouting), one side's output was
+        silently lost, and the unordered restores could leave a dead StringIO
+        installed as the process's stdout. Fix: install a process-wide
+        thread-routing proxy ONCE; each cell registers its buffers for its
+        own exec thread only. Threads the model spawns inside a cell are not
+        registered and fall through to the real stream — never to another
+        rollout's buffer.
+        """
+        out_router, err_router = _install_stream_routers()
+        stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
+        out_router.register(stdout_buf)
+        err_router.register(stderr_buf)
+        try:
+            yield stdout_buf, stderr_buf
+        finally:
+            out_router.unregister()
+            err_router.unregister()
 
     @contextmanager
     def _temp_cwd(self):
