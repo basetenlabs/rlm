@@ -118,13 +118,26 @@ class _ThreadRoutedStream(io.TextIOBase):
         return self._routes.get(threading.get_ident(), self._fallback)
 
     def write(self, s: str) -> int:
-        return self._target().write(s)
+        # A target can be closed by its owner (pytest capture teardown, a
+        # cleaned-up REPL). Degrade to the real stream, never raise into the
+        # printing thread.
+        try:
+            return self._target().write(s)
+        except ValueError:
+            real = getattr(sys, "__stdout__", None)
+            try:
+                return real.write(s) if real else len(s)
+            except (ValueError, OSError):
+                return len(s)
 
     def flush(self) -> None:
         target = self._target()
         flush = getattr(target, "flush", None)
         if flush is not None:
-            flush()
+            try:
+                flush()
+            except (ValueError, OSError):
+                pass
 
     def writable(self) -> bool:
         return True
