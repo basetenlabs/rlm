@@ -77,9 +77,16 @@ class LMRequestHandler(StreamRequestHandler):
         """
         client = handler.get_client(request.model, request.depth)
 
+        from rlm.utils.global_gate import get_gate
+
+        gate = get_gate()
         start_time = time.perf_counter()
         try:
-            content = client.completion(request.prompt)
+            if gate is not None:
+                with gate.slot():  # deployment-wide cap, retries held inside
+                    content = client.completion(request.prompt)
+            else:
+                content = client.completion(request.prompt)
         except Exception as e:  # noqa: BLE001 — reason must reach the model in-band
             return LMResponse.error_response(f"llm() call failed - {e}")
         end_time = time.perf_counter()
@@ -116,10 +123,24 @@ class LMRequestHandler(StreamRequestHandler):
         start_time = time.perf_counter()
 
         sem = asyncio.Semaphore(handler.batch_max_concurrent)
+        from rlm.utils.global_gate import get_gate
+
+        gate = get_gate()
 
         async def run_one(prompt: str):
             async with sem:
-                return await client.acompletion(prompt)
+                if gate is None:
+                    return await client.acompletion(prompt)
+                # Deployment-wide slot held for the call's full duration (SDK
+                # retries included). Acquisition is a blocking flock spin, so
+                # it runs in a thread; its jittered sleep doubles as launch
+                # smearing for same-second wave bursts.
+                slot = gate.slot()
+                await asyncio.to_thread(slot.__enter__)
+                try:
+                    return await client.acompletion(prompt)
+                finally:
+                    slot.__exit__(None, None, None)
 
         async def run_all():
             tasks = [run_one(prompt) for prompt in request.prompts]
