@@ -161,6 +161,12 @@ class RLMTrainEnv(vf.MultiTurnEnv):
             await backend.bootstrap(self._bootstrap_code)
 
         metadata = QueryMetadata(context_payload)
+        # The parsed context is fully consumed above (REPL load + metadata).
+        # Leaving it in state["info"] makes verifiers serialise the whole
+        # corpus into every traces.jsonl record (~240MB/rollout on VDR rooms).
+        # Copy-and-strip rather than mutate: the dict may be shared with the
+        # dataset row, which must keep whatever the caller put there.
+        state["info"] = {k: v for k, v in info.items() if k != "context"}
         base = build_rlm_system_prompt(
             system_prompt=self._system_prompt,
             query_metadata=metadata,
