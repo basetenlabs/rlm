@@ -240,16 +240,12 @@ class RLM:
         self.max_timeout = max_timeout
         self.max_tokens = max_tokens
         self.max_errors = max_errors
-        # Default prompt tracks the answer protocol: slot mode
-        # (``deliverable_slots`` set, e.g. ``MultiDeliverableRLM``) describes the
-        # ``answer["deliverables"]`` slots; otherwise the upstream
-        # ``answer["content"]`` protocol. A ``custom_system_prompt`` overrides both.
-        if custom_system_prompt:
-            self.system_prompt = custom_system_prompt
-        elif deliverable_slots is not None:
-            self.system_prompt = RLM_SYSTEM_PROMPT_SLOTS
-        else:
-            self.system_prompt = RLM_SYSTEM_PROMPT
+        # Default prompt tracks the answer protocol via the SHARED selection
+        # (utils.prompts.select_system_prompt) — the RL loop uses the same
+        # function, so the two harnesses cannot teach different protocols.
+        from rlm.utils.prompts import select_system_prompt
+
+        self.system_prompt = select_system_prompt(deliverable_slots, custom_system_prompt)
         self.orchestrator = orchestrator
         # "orchestrator" (default) or "direct-read" (delegation-neutral
         # addendum for force/direct-read roots; see prompts.DIRECT_READ_ADDENDUM).

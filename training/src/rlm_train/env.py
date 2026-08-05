@@ -19,6 +19,7 @@ from rlm.utils.prompts import (
     QueryMetadata,
     build_rlm_system_prompt,
     build_user_prompt,
+    select_system_prompt,
 )
 from rlm_train.proxy import ClientHandle, SubLLMProxy
 from rlm_train.repl.base import ExecResult, ReplBackend
@@ -47,6 +48,7 @@ class RLMTrainEnv(vf.MultiTurnEnv):
         sub_model: str | None = None,
         sub_sampling_args: dict[str, Any] | None = None,
         custom_system_prompt: str | None = None,
+        deliverable_slots: list[str] | None = None,
         rubric: vf.Rubric | None = None,
         sub_llm_fn: Callable[[str, Any], Any] | None = None,
         sub_llm_fn_batched: Callable[[list[str], Any], Any] | None = None,
@@ -66,7 +68,12 @@ class RLMTrainEnv(vf.MultiTurnEnv):
         self._max_iterations = max_iterations
         self._sub_model = sub_model
         self._sub_sampling_args = sub_sampling_args or {"max_tokens": 4096}
-        self._system_prompt = custom_system_prompt or RLM_SYSTEM_PROMPT
+        # SHARED protocol→prompt selection (rlm.utils.prompts.select_system_prompt),
+        # the same call the eval engine makes. This used to be
+        # `custom_system_prompt or RLM_SYSTEM_PROMPT`, which taught the upstream
+        # answer["content"] protocol to roots whose REPL ran SLOT mode — the
+        # contradictory-instructions bug behind L25's finalize-empty episodes.
+        self._system_prompt = select_system_prompt(deliverable_slots, custom_system_prompt)
         self._orchestrator = orchestrator
         self._user_prologue = user_prologue
         self._sub_llm_fn = sub_llm_fn

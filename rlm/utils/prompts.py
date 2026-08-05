@@ -261,6 +261,31 @@ DIRECT_READ_ADDENDUM = "\n\n".join(
 _DEFAULT_MAX_ITERATIONS = 30
 
 
+def select_system_prompt(
+    deliverable_slots: list[str] | None,
+    custom_system_prompt: str | None = None,
+) -> str:
+    """THE answer-protocol → system-prompt selection, shared by every harness.
+
+    Slot mode (``deliverable_slots`` set) must get ``RLM_SYSTEM_PROMPT_SLOTS``;
+    otherwise the upstream content-protocol prompt. An explicit
+    ``custom_system_prompt`` overrides both.
+
+    Extracted 2026-08-05: the eval engine (``rlm.core.rlm.RLM``) selected
+    correctly, but the RL loop (``rlm_train.env.RLMTrainEnv``) defaulted to the
+    content-protocol prompt while its REPL ran slot mode — so every RL episode's
+    SYSTEM prompt taught ``answer["content"]`` while the user prompt asked for
+    ``answer["deliverables"]``. Models obeyed the system prompt: ~2/3 of L25
+    episodes finalized into ``answer["content"]`` and graded as absent
+    deliverables. Contradictory instructions must be impossible by construction.
+    """
+    if custom_system_prompt:
+        return custom_system_prompt
+    if deliverable_slots is not None:
+        return RLM_SYSTEM_PROMPT_SLOTS
+    return RLM_SYSTEM_PROMPT
+
+
 def build_rlm_system_prompt(
     system_prompt: str,
     query_metadata: QueryMetadata,
