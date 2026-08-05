@@ -16,8 +16,15 @@ def find_code_blocks(text: str) -> list[str]:
     GLM-5.2 with thinking disabled emits these variants systematically, and a
     strict fence silently drops the code (2026-07-09 nothink probe). "repl"
     must still be the whole first word, so ```replace is not a REPL block.
+
+    ```python / ```py fences are accepted too: Qwen3.5-122B nothink t0.6
+    locks into ```python against explicit ```repl instructions in ~13% of RL
+    episodes (2026-08-05, L25 transcripts: 79/79 turns ```python, zero cells
+    executed, whole episode wasted with no error signal). Aaron's data-gen
+    pod already ran a lenient parser, so leniency also matches the setup that
+    produced the reference numbers.
     """
-    pattern = r"```repl(?:[ \t][^\n]*)?\n(.*?)\n```"
+    pattern = r"```(?:repl|python|py)(?:[ \t][^\n]*)?\n(.*?)\n```"
     results = []
 
     for match in re.finditer(pattern, text, re.DOTALL):

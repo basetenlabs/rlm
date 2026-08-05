@@ -13,7 +13,7 @@ from typing import Any
 import verifiers as vf
 from verifiers.types import Messages, State
 
-from rlm.utils.parsing import find_code_blocks
+from rlm.utils.parsing import NO_CODE_FEEDBACK, find_code_blocks
 from rlm.utils.prompts import (
     RLM_SYSTEM_PROMPT,
     QueryMetadata,
@@ -233,6 +233,12 @@ class RLMTrainEnv(vf.MultiTurnEnv):
             repl_msgs = _format_repl_outputs(outputs)
             history.append(assistant_msg)
             history.extend(repl_msgs)
+            if not outputs and final_from_answer is None:
+                # No parseable code block: without corrective signal the model
+                # pattern-locks on its own prior turn and burns the whole budget
+                # (L25 transcripts: 79/79 turns of unexecuted code). Same
+                # feedback the eval loop uses.
+                history.append({"role": "user", "content": NO_CODE_FEEDBACK})
             state["rlm_n_processed"] = n_processed + 1
             state["rlm_iterations"] = n_processed + 1
             n_processed += 1
