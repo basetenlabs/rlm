@@ -711,24 +711,21 @@ class RLM:
         return best
 
     def _check_timeout(self, iteration: int, time_start: float) -> None:
-        """Raise TimeoutExceededError if the timeout has been exceeded."""
-        if self.max_timeout is None:
-            return
-        elapsed = time.perf_counter() - time_start
-        if elapsed > self.max_timeout:
-            self.verbose.print_limit_exceeded(
+        """Raise TimeoutExceededError via the SHARED enforcement
+        (``rlm.utils.exceptions.check_episode_budget`` — the RL loop calls the
+        same function, so episode budgets cannot silently diverge)."""
+        from rlm.utils.exceptions import check_episode_budget
+
+        check_episode_budget(
+            self.max_timeout,
+            time_start,
+            iteration=iteration,
+            partial_answer=self._best_partial_answer,
+            on_exceeded=lambda elapsed: self.verbose.print_limit_exceeded(
                 "timeout",
                 f"{elapsed:.1f}s of {self.max_timeout:.1f}s",
-            )
-            raise TimeoutExceededError(
-                elapsed=elapsed,
-                timeout=self.max_timeout,
-                partial_answer=self._best_partial_answer,
-                message=(
-                    f"Timeout exceeded after iteration {iteration}: "
-                    f"{elapsed:.1f}s of {self.max_timeout:.1f}s limit"
-                ),
-            )
+            ),
+        )
 
     def _check_iteration_limits(
         self, iteration: RLMIteration, iteration_num: int, lm_handler: LMHandler

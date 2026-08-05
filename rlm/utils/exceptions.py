@@ -71,3 +71,42 @@ class CancellationError(Exception):
     def __init__(self, partial_answer: str | None = None, message: str | None = None):
         self.partial_answer = partial_answer
         super().__init__(message or "Execution cancelled by user")
+
+
+def check_episode_budget(
+    max_timeout: float | None,
+    time_start: float | None,
+    *,
+    iteration: int,
+    partial_answer: str | None = None,
+    on_exceeded=None,
+) -> None:
+    """THE episode wall-clock enforcement, shared by every RLM loop.
+
+    Raises :class:`TimeoutExceededError` once ``max_timeout`` seconds have
+    elapsed since ``time_start`` (``time.perf_counter()`` domain). ``None``
+    for either argument disables the check.
+
+    Extracted 2026-08-05: ``rlm.completion`` enforced this but the RL loop
+    (``rlm_train.env.RLMTrainEnv``) never mirrored it, so RL episodes had NO
+    wall bound at all before the first weight update (off-policy staleness
+    cancellation, the implicit substitute, only fires at weight updates).
+    Both loops now call this one function.
+    """
+    if max_timeout is None or time_start is None:
+        return
+    import time
+
+    elapsed = time.perf_counter() - time_start
+    if elapsed > max_timeout:
+        if on_exceeded is not None:
+            on_exceeded(elapsed)
+        raise TimeoutExceededError(
+            elapsed=elapsed,
+            timeout=max_timeout,
+            partial_answer=partial_answer,
+            message=(
+                f"Timeout exceeded after iteration {iteration}: "
+                f"{elapsed:.1f}s of {max_timeout:.1f}s limit"
+            ),
+        )

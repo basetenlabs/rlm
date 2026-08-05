@@ -49,6 +49,7 @@ class RLMTrainEnv(vf.MultiTurnEnv):
         sub_sampling_args: dict[str, Any] | None = None,
         custom_system_prompt: str | None = None,
         deliverable_slots: list[str] | None = None,
+        max_timeout: float | None = None,
         rubric: vf.Rubric | None = None,
         sub_llm_fn: Callable[[str, Any], Any] | None = None,
         sub_llm_fn_batched: Callable[[list[str], Any], Any] | None = None,
@@ -66,6 +67,12 @@ class RLMTrainEnv(vf.MultiTurnEnv):
         )
         self._backend_factory = backend_factory or (lambda: SubprocessReplBackend())
         self._max_iterations = max_iterations
+        # Episode wall budget, enforced via the SHARED check
+        # (rlm.utils.exceptions.check_episode_budget — the same function
+        # rlm.completion calls). None = unbounded, which was the silent
+        # pre-2026-08-05 behavior: RL episodes had no wall bound at all until
+        # the first weight update enabled staleness cancellation.
+        self._max_timeout = max_timeout
         self._sub_model = sub_model
         self._sub_sampling_args = sub_sampling_args or {"max_tokens": 4096}
         # SHARED protocol→prompt selection (rlm.utils.prompts.select_system_prompt),
@@ -117,6 +124,7 @@ class RLMTrainEnv(vf.MultiTurnEnv):
 
     async def setup_state(self, state: State) -> None:
         await super().setup_state(state)
+        state["rlm_time_start"] = time.perf_counter()
 
         info = state.get("info") or {}
         context_payload = info.get("context")
@@ -179,6 +187,17 @@ class RLMTrainEnv(vf.MultiTurnEnv):
         state["prompt"] = list(state["rlm_history"])
 
     async def get_prompt_messages(self, state: State) -> Messages:
+        # Episode wall budget — the SHARED enforcement rlm.completion uses.
+        # Raising here fails the rollout task; the dispatcher converts it to
+        # error-marked rollouts that never train (same "a timeout is not a
+        # measurement" semantics as eval's TimeoutExceededError path).
+        from rlm.utils.exceptions import check_episode_budget
+
+        check_episode_budget(
+            self._max_timeout,
+            state.get("rlm_time_start"),
+            iteration=int(state.get("rlm_n_processed") or 0),
+        )
         if _TIMING:
             _now = time.monotonic()
             timing = state.setdefault(
