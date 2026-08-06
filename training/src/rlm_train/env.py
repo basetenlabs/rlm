@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -198,16 +199,29 @@ class RLMTrainEnv(vf.MultiTurnEnv):
 
     async def get_prompt_messages(self, state: State) -> Messages:
         # Episode wall budget — the SHARED enforcement rlm.completion uses.
-        # Raising here fails the rollout task; the dispatcher converts it to
-        # error-marked rollouts that never train (same "a timeout is not a
-        # measurement" semantics as eval's TimeoutExceededError path).
-        from rlm.utils.exceptions import check_episode_budget
+        # Budget overruns are SCORED ZERO, not discarded (decision 2026-08-06):
+        # an unsubmitted report is worth zero, and with GRPO the zero lands
+        # next to same-task siblings that finished — teaching the policy to
+        # calibrate episode length instead of blindly pushing into the wall
+        # (at L26 step 15, 29% of episodes were budget-killed and silently
+        # dropped, starving the long-grind behavior of its best exemplars
+        # while giving no signal to stay in budget). We finalize with an
+        # empty slot dict, which flows through the normal staging →
+        # placeholder → judge-skip hard-zero path as a TRAINABLE rollout.
+        # Non-budget errors still raise and are discarded — "a timeout is
+        # not a measurement" continues to apply to infrastructure faults.
+        from rlm.utils.exceptions import TimeoutExceededError, check_episode_budget
 
-        check_episode_budget(
-            self._max_timeout,
-            state.get("rlm_time_start"),
-            iteration=int(state.get("rlm_n_processed") or 0),
-        )
+        try:
+            check_episode_budget(
+                self._max_timeout,
+                state.get("rlm_time_start"),
+                iteration=int(state.get("rlm_n_processed") or 0),
+            )
+        except TimeoutExceededError as e:
+            state["rlm_budget_exceeded"] = str(e)
+            state["rlm_final_answer"] = json.dumps({"deliverables": {}})
+            return list(state["rlm_history"])
         if _TIMING:
             _now = time.monotonic()
             timing = state.setdefault(
