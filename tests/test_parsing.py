@@ -45,7 +45,9 @@ End."""
         blocks = find_code_blocks(text)
         assert blocks == []
 
-    def test_non_repl_code_blocks_ignored(self):
+    def test_python_and_py_fences_accepted(self):
+        # Qwen3.5-122B nothink locks into ```python against explicit ```repl
+        # instructions (~13% of RL episodes, L25); accepted since 80078a6.
         text = """Python block:
 ```python
 x = 1
@@ -54,7 +56,19 @@ REPL block:
 ```repl
 y = 2
 ```
+py block:
+```py
+z = 3
+```
 """
+        blocks = find_code_blocks(text)
+        assert len(blocks) == 3
+        assert "x = 1" in blocks[0]
+        assert "y = 2" in blocks[1]
+        assert "z = 3" in blocks[2]
+
+    def test_other_language_fences_ignored(self):
+        text = "```javascript\nconsole.log(1)\n```\n```repl\ny = 2\n```"
         blocks = find_code_blocks(text)
         assert len(blocks) == 1
         assert "y = 2" in blocks[0]
@@ -75,6 +89,67 @@ y = 2
         blocks = find_code_blocks(text)
         assert len(blocks) == 1
         assert "y = 2" in blocks[0]
+
+    def test_glm_tool_call_opener_bare_code(self):
+        # Verbatim shape of the compass-japan-services lock (vdr6 iSFT ep2,
+        # 2026-08-06): GLM-native <tool_call>repl opener, bare code, ``` closer.
+        # 487 identical emissions, zero cells executed, empty deliverable.
+        text = (
+            "<tool_call>repl\n"
+            'batch2 = prompts[15:30]\n'
+            'results2 = llm_query_batched(batch2, model="qwen3.5-122b-a10b-base")\n'
+            'print("Batch 2 done. Lengths:", [len(r) for r in results2])\n'
+            "```"
+        )
+        blocks = find_code_blocks(text)
+        assert len(blocks) == 1
+        assert "batch2 = prompts[15:30]" in blocks[0]
+        assert "<tool_call>" not in blocks[0]
+
+    def test_glm_tool_call_opener_arg_value_closer(self):
+        # compass iteration 1 closed with </arg_value> instead of ```.
+        text = (
+            "<tool_call>repl\n"
+            "print(type(context))\n"
+            "paths = list(context.keys())\n"
+            "</arg_value>"
+        )
+        blocks = find_code_blocks(text)
+        assert len(blocks) == 1
+        assert "print(type(context))" in blocks[0]
+        assert "</arg_value>" not in blocks[0]
+
+    def test_glm_tool_call_opener_tool_call_closer(self):
+        text = "<tool_call>repl\nx = 1\nprint(x)\n</tool_call>"
+        blocks = find_code_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0] == "x = 1\nprint(x)"
+
+    def test_glm_tool_call_with_nested_python_fence(self):
+        # Verbatim shape of the coeur-mining-r2-gold lock (vdr6 iSFT ep2,
+        # 2026-08-06): <tool_call>repl opener wrapping a complete ```python
+        # fence. The fence pass must win so the extracted code does NOT carry
+        # a leading ```python line (which would be a REPL syntax error).
+        text = (
+            "<tool_call>repl\n"
+            "```python\n"
+            "import collections\n"
+            "for cat in sorted(cats.keys()):\n"
+            "    print(cat)\n"
+            "```\n"
+            "\n"
+            '<span class="step" />'
+        )
+        blocks = find_code_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0].startswith("import collections")
+        assert "```" not in blocks[0]
+
+    def test_tool_call_other_tools_ignored(self):
+        # Only the repl tool is executable; other GLM tool calls are not code.
+        text = "<tool_call>search\nquery = 'foo'\n</tool_call>"
+        blocks = find_code_blocks(text)
+        assert blocks == []
 
     def test_multiline_code_block(self):
         text = """```repl

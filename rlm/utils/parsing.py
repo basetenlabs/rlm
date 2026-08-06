@@ -23,15 +23,22 @@ def find_code_blocks(text: str) -> list[str]:
     executed, whole episode wasted with no error signal). Aaron's data-gen
     pod already ran a lenient parser, so leniency also matches the setup that
     produced the reference numbers.
+
+    <tool_call>repl openers are a fallback pass: nothink-SFT GLM-5.2 roots
+    fall back to GLM's native tool-call syntax instead of a backtick fence
+    (2026-08-06 vdr6 iSFT ep2: 2/10 rooms locked on it to the 500-iteration
+    cap, empty deliverables). Observed closers: ```, </tool_call>,
+    </arg_value>. The fence pass runs first so a <tool_call>repl wrapper
+    around a complete ```python fence extracts the inner code without the
+    fence line.
     """
     pattern = r"```(?:repl|python|py)(?:[ \t][^\n]*)?\n(.*?)\n```"
-    results = []
+    results = [m.group(1).strip() for m in re.finditer(pattern, text, re.DOTALL)]
+    if results:
+        return results
 
-    for match in re.finditer(pattern, text, re.DOTALL):
-        code_content = match.group(1).strip()
-        results.append(code_content)
-
-    return results
+    tool_call_pattern = r"<tool_call>repl(?:[ \t][^\n]*)?\n(.*?)\n(?:```|</tool_call>|</arg_value>)"
+    return [m.group(1).strip() for m in re.finditer(tool_call_pattern, text, re.DOTALL)]
 
 
 # Sent as the user turn when a response contained no parseable ```repl block.
