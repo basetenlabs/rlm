@@ -272,6 +272,10 @@ class RLMTrainEnv(vf.MultiTurnEnv):
                     )
                     continue
                 else:
+                    state["rlm_sub_llm_calls"] = (
+                        int(state.get("rlm_sub_llm_calls") or 0)
+                        + int(getattr(result, "n_subcalls", 0) or 0)
+                    )
                     if _TIMING:
                         timing["repl_exec_s"] += time.monotonic() - _t_exec
                         timing["n_cells"] += 1
