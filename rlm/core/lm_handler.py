@@ -7,7 +7,7 @@ Uses a multi-threaded socket server. Protocol: 4-byte length prefix + JSON paylo
 import asyncio
 import time
 from socketserver import StreamRequestHandler, ThreadingTCPServer
-from threading import Thread
+from threading import Lock, Thread
 
 from rlm.clients.base_lm import BaseLM
 from rlm.core.comms_utils import (
@@ -122,12 +122,11 @@ class LMRequestHandler(StreamRequestHandler):
         pre_in, pre_out = _cum()
         start_time = time.perf_counter()
 
-        sem = asyncio.Semaphore(handler.batch_max_concurrent)
         from rlm.utils.global_gate import get_gate
 
         gate = get_gate()
 
-        async def run_one(prompt: str):
+        async def run_one(prompt: str, sem: asyncio.Semaphore):
             async with sem:
                 if gate is None:
                     return await client.acompletion(prompt)
@@ -143,20 +142,42 @@ class LMRequestHandler(StreamRequestHandler):
                     slot.__exit__(None, None, None)
 
         async def run_all():
-            tasks = [run_one(prompt) for prompt in request.prompts]
+            # The semaphore is created INSIDE the coroutine so it binds to the
+            # handler's persistent loop, never to a caller thread's loop.
+            sem = asyncio.Semaphore(handler.batch_max_concurrent)
+            tasks = [run_one(prompt, sem) for prompt in request.prompts]
             # return_exceptions=True so one failed call doesn't abort the whole
             # batch; failures are surfaced per-prompt as error completions below.
             return await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Every wave runs on the handler's ONE persistent event loop
+        # (LMHandler.event_loop). Until 2026-09-05 this was ``asyncio.run(...)``
+        # per wave: a fresh loop each time, while ``client.acompletion`` reused
+        # the shared ``AsyncOpenAI``/httpx connection pool whose pooled
+        # connections were bound to the previous, now-closed loop. Reusing them
+        # raised ``RuntimeError`` inside the SDK on ~70% of batched calls
+        # (164 retries + 3 hard "Connection error." failures in 224 calls,
+        # reproduced through this exact path against the Qwen subagent
+        # deployment); each abandoned connection was logged as a 499 at the
+        # edge (~20% of that deployment's requests, wasted GPU work), and the
+        # residual hard failures leaked "Error: llm() call failed - Connection
+        # error" into REPL output and final deliverables. The single-prompt
+        # path (sync client) never had the problem.
+        #
         # Hard wave deadline: a severed provider connection can otherwise park
         # the gather forever (all awaits suspended, nothing on the wire). On
         # timeout every prompt gets an error completion, which the REPL surfaces
         # to the root as retryable "Error: ..." strings.
+        future = asyncio.run_coroutine_threadsafe(
+            asyncio.wait_for(run_all(), timeout=DEFAULT_WAVE_TIMEOUT),
+            handler.event_loop(),
+        )
         try:
-            results = asyncio.run(
-                asyncio.wait_for(run_all(), timeout=DEFAULT_WAVE_TIMEOUT)
-            )
-        except (asyncio.TimeoutError, TimeoutError):
+            # Small grace over the in-loop deadline so wait_for's own
+            # TimeoutError (per-prompt error completions) is the normal path.
+            results = future.result(timeout=DEFAULT_WAVE_TIMEOUT + 30)
+        except TimeoutError:
+            future.cancel()
             err = TimeoutError(
                 f"batched wave exceeded RLM_WAVE_TIMEOUT={DEFAULT_WAVE_TIMEOUT:.0f}s "
                 "(wedged provider connections?)"
@@ -171,13 +192,15 @@ class LMRequestHandler(StreamRequestHandler):
         # call in this batch) to the FIRST successful completion, zero to the rest, so
         # the trajectory's per-call rlm_calls sum to the exact batch total. The client's
         # accumulation stays authoritative; this only fixes how usage is logged per-entry.
-        batch_usage = UsageSummary(model_usage_summaries={
-            root_model: ModelUsageSummary(
-                total_calls=n_ok,
-                total_input_tokens=post_in - pre_in,
-                total_output_tokens=post_out - pre_out,
-            )
-        })
+        batch_usage = UsageSummary(
+            model_usage_summaries={
+                root_model: ModelUsageSummary(
+                    total_calls=n_ok,
+                    total_input_tokens=post_in - pre_in,
+                    total_output_tokens=post_out - pre_out,
+                )
+            }
+        )
         empty_usage = UsageSummary(model_usage_summaries={})
 
         chat_completions = []
@@ -242,8 +265,28 @@ class LMHandler:
         self._thread: Thread | None = None
         self._port = port
         self.batch_max_concurrent = batch_max_concurrent
+        # One persistent event loop for every batched wave (see _handle_batched).
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: Thread | None = None
+        self._loop_lock = Lock()
 
         self.register_client(client.model_name, client)
+
+    def event_loop(self) -> asyncio.AbstractEventLoop:
+        """The handler's single long-lived event loop (started on first use).
+
+        Async clients (``AsyncOpenAI`` -> httpx) pool connections that belong to
+        the loop that created them. Running each batched wave under its own
+        ``asyncio.run`` loop made every later wave reuse connections from a dead
+        loop; keeping one loop for the handler's lifetime keeps the pool valid.
+        """
+        with self._loop_lock:
+            if self._loop is None or self._loop.is_closed():
+                loop = asyncio.new_event_loop()
+                thread = Thread(target=loop.run_forever, name="lm-handler-loop", daemon=True)
+                thread.start()
+                self._loop, self._loop_thread = loop, thread
+            return self._loop
 
     def register_client(self, model_name: str, client: BaseLM) -> None:
         """Register a client for a specific model name."""
@@ -292,11 +335,20 @@ class LMHandler:
         return self.address
 
     def stop(self):
-        """Stop the socket server."""
+        """Stop the socket server (and the batched-wave event loop)."""
         if self._server:
             self._server.shutdown()
             self._server = None
             self._thread = None
+        with self._loop_lock:
+            loop, thread = self._loop, self._loop_thread
+            self._loop, self._loop_thread = None, None
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(loop.stop)
+            if thread is not None:
+                thread.join(timeout=5)
+            if not loop.is_running():
+                loop.close()
 
     def completion(self, prompt: str, model: str | None = None) -> str:
         """Direct completion call (for main process use)."""
@@ -321,8 +373,7 @@ class LMHandler:
         """
         unique_clients: list[BaseLM] = []
         seen: set[int] = set()
-        for candidate in (self.default_client, self.other_backend_client,
-                          *self.clients.values()):
+        for candidate in (self.default_client, self.other_backend_client, *self.clients.values()):
             if candidate is None or id(candidate) in seen:
                 continue
             seen.add(id(candidate))
