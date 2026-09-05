@@ -126,26 +126,23 @@ class LMRequestHandler(StreamRequestHandler):
 
         gate = get_gate()
 
-        async def run_one(prompt: str, sem: asyncio.Semaphore):
-            async with sem:
+        async def run_one(prompt: str):
+            # This semaphore belongs to the handler, not one request wave. A
+            # worker can serve several concurrent socket requests, and a
+            # per-wave semaphore lets their aggregate gate/DNS work multiply
+            # past ``batch_max_concurrent``.
+            async with handler.batch_semaphore():
                 if gate is None:
                     return await client.acompletion(prompt)
                 # Deployment-wide slot held for the call's full duration (SDK
-                # retries included). Acquisition is a blocking flock spin, so
-                # it runs in a thread; its jittered sleep doubles as launch
-                # smearing for same-second wave bursts.
-                slot = gate.slot()
-                await asyncio.to_thread(slot.__enter__)
-                try:
+                # retries included). Thread-free acquisition avoids filling
+                # this loop's default executor with blocking flock waiters,
+                # which can starve httpx DNS/connect work on the same loop.
+                async with gate.async_slot():
                     return await client.acompletion(prompt)
-                finally:
-                    slot.__exit__(None, None, None)
 
         async def run_all():
-            # The semaphore is created INSIDE the coroutine so it binds to the
-            # handler's persistent loop, never to a caller thread's loop.
-            sem = asyncio.Semaphore(handler.batch_max_concurrent)
-            tasks = [run_one(prompt, sem) for prompt in request.prompts]
+            tasks = [run_one(prompt) for prompt in request.prompts]
             # return_exceptions=True so one failed call doesn't abort the whole
             # batch; failures are surfaced per-prompt as error completions below.
             return await asyncio.gather(*tasks, return_exceptions=True)
@@ -269,6 +266,7 @@ class LMHandler:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: Thread | None = None
         self._loop_lock = Lock()
+        self._batch_semaphore: asyncio.Semaphore | None = None
 
         self.register_client(client.model_name, client)
 
@@ -287,6 +285,15 @@ class LMHandler:
                 thread.start()
                 self._loop, self._loop_thread = loop, thread
             return self._loop
+
+    def batch_semaphore(self) -> asyncio.Semaphore:
+        """Return the handler-wide concurrency bound on its persistent loop."""
+        loop = asyncio.get_running_loop()
+        if loop is not self._loop:
+            raise RuntimeError("batch semaphore requested outside the handler event loop")
+        if self._batch_semaphore is None:
+            self._batch_semaphore = asyncio.Semaphore(self.batch_max_concurrent)
+        return self._batch_semaphore
 
     def register_client(self, model_name: str, client: BaseLM) -> None:
         """Register a client for a specific model name."""
@@ -343,6 +350,7 @@ class LMHandler:
         with self._loop_lock:
             loop, thread = self._loop, self._loop_thread
             self._loop, self._loop_thread = None, None
+            self._batch_semaphore = None
         if loop is not None and not loop.is_closed():
             loop.call_soon_threadsafe(loop.stop)
             if thread is not None:

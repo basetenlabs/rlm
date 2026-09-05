@@ -12,6 +12,7 @@ Connection error`` in REPL output and deliverables.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from rlm.clients.base_lm import BaseLM
 from rlm.core.comms_utils import send_lm_request_batched
@@ -61,3 +62,41 @@ def test_batched_waves_share_one_event_loop():
     assert len(set(client.loops)) == 1
     # And the loop is the handler's own, not a caller thread's.
     assert handler._loop is None  # stop() tore it down
+
+
+def test_concurrent_waves_share_one_handler_wide_limit():
+    class ConcurrencyRecordingLM(_LoopRecordingLM):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.peak = 0
+
+        async def acompletion(self, prompt, model=None):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            try:
+                await asyncio.sleep(0.05)
+                return f"async:{prompt}"
+            finally:
+                self.active -= 1
+
+    client = ConcurrencyRecordingLM()
+    handler = LMHandler(client, batch_max_concurrent=2)
+    addr = handler.start()
+    try:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(
+                    send_lm_request_batched,
+                    addr,
+                    [f"{wave}:{idx}" for idx in range(4)],
+                    depth=1,
+                )
+                for wave in range(3)
+            ]
+            results = [future.result() for future in futures]
+    finally:
+        handler.stop()
+
+    assert all(result.success for wave in results for result in wave)
+    assert client.peak == 2
