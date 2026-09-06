@@ -5,9 +5,10 @@ Uses a multi-threaded socket server. Protocol: 4-byte length prefix + JSON paylo
 """
 
 import asyncio
+import inspect
 import time
 from socketserver import StreamRequestHandler, ThreadingTCPServer
-from threading import Thread
+from threading import Event, Thread
 
 from rlm.clients.base_lm import BaseLM
 from rlm.core.comms_utils import (
@@ -153,8 +154,9 @@ class LMRequestHandler(StreamRequestHandler):
         # timeout every prompt gets an error completion, which the REPL surfaces
         # to the root as retryable "Error: ..." strings.
         try:
-            results = asyncio.run(
-                asyncio.wait_for(run_all(), timeout=DEFAULT_WAVE_TIMEOUT)
+            results = handler.run_async(
+                asyncio.wait_for(run_all(), timeout=DEFAULT_WAVE_TIMEOUT),
+                timeout=DEFAULT_WAVE_TIMEOUT + 5,
             )
         except (asyncio.TimeoutError, TimeoutError):
             err = TimeoutError(
@@ -240,6 +242,15 @@ class LMHandler:
         self.host = host
         self._server: ThreadingLMServer | None = None
         self._thread: Thread | None = None
+        # Async clients (notably httpx/OpenAI) bind connection pools to the
+        # event loop that first uses them. Creating a fresh loop with
+        # asyncio.run() for every batch caused pooled connections from the
+        # previous loop to be abandoned, producing large waves of HTTP 499s
+        # that the SDK then retried transparently. One handler-owned loop keeps
+        # the client and every batch on the same lifecycle.
+        self._async_loop: asyncio.AbstractEventLoop | None = None
+        self._async_thread: Thread | None = None
+        self._async_ready = Event()
         self._port = port
         self.batch_max_concurrent = batch_max_concurrent
 
@@ -283,6 +294,13 @@ class LMHandler:
         if self._server is not None:
             return self.address
 
+        self._async_loop = asyncio.new_event_loop()
+        self._async_ready.clear()
+        self._async_thread = Thread(target=self._serve_async_loop, daemon=True)
+        self._async_thread.start()
+        if not self._async_ready.wait(timeout=5):
+            raise RuntimeError("LMHandler async event loop failed to start")
+
         self._server = ThreadingLMServer((self.host, self._port), LMRequestHandler)
         self._server.lm_handler = self  # type: ignore
 
@@ -291,12 +309,68 @@ class LMHandler:
 
         return self.address
 
+    def _serve_async_loop(self) -> None:
+        assert self._async_loop is not None
+        asyncio.set_event_loop(self._async_loop)
+        self._async_ready.set()
+        self._async_loop.run_forever()
+        pending = asyncio.all_tasks(self._async_loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            self._async_loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        self._async_loop.run_until_complete(self._async_loop.shutdown_asyncgens())
+        self._async_loop.close()
+
+    def run_async(self, coroutine, *, timeout: float):
+        """Run a coroutine on the handler's single long-lived event loop."""
+        if self._async_loop is None or not self._async_loop.is_running():
+            if inspect.iscoroutine(coroutine):
+                coroutine.close()
+            raise RuntimeError("LMHandler async event loop is not running")
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._async_loop)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            future.cancel()
+            raise
+
+    async def _close_async_clients(self) -> None:
+        seen: set[int] = set()
+        for client in (
+            self.default_client,
+            self.other_backend_client,
+            *self.clients.values(),
+        ):
+            if client is None or id(client) in seen:
+                continue
+            seen.add(id(client))
+            async_client = getattr(client, "async_client", None)
+            close = getattr(async_client, "close", None)
+            if close is None:
+                continue
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
     def stop(self):
         """Stop the socket server."""
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
             self._thread = None
+        if self._async_loop is not None and self._async_loop.is_running():
+            try:
+                self.run_async(self._close_async_clients(), timeout=10)
+            finally:
+                self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+        if self._async_thread is not None:
+            self._async_thread.join(timeout=10)
+            self._async_thread = None
+        self._async_loop = None
 
     def completion(self, prompt: str, model: str | None = None) -> str:
         """Direct completion call (for main process use)."""

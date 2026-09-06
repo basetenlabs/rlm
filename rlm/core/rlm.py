@@ -1,6 +1,7 @@
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
+from threading import Lock
 from typing import Any
 
 from rlm.clients import BaseLM, get_client
@@ -10,6 +11,7 @@ from rlm.core.types import (
     ClientBackend,
     CodeBlock,
     EnvironmentType,
+    ModelUsageSummary,
     REPLResult,
     RLMChatCompletion,
     RLMIteration,
@@ -116,6 +118,7 @@ class RLM:
         compaction: bool = False,
         compaction_threshold_pct: float = 0.85,
         max_concurrent_subcalls: int = 4,
+        batch_max_concurrent: int = 16,
         on_subcall_start: Callable[[int, str, str], None] | None = None,
         on_subcall_complete: Callable[[int, str, float, str | None], None] | None = None,
         on_iteration_start: Callable[[int, int], None] | None = None,
@@ -231,6 +234,7 @@ class RLM:
         self.compaction = compaction
         self.compaction_threshold_pct = compaction_threshold_pct
         self.max_concurrent_subcalls = max_concurrent_subcalls
+        self.batch_max_concurrent = batch_max_concurrent
 
         self.depth = depth
         self.max_depth = max_depth
@@ -290,6 +294,8 @@ class RLM:
         self._last_error: str | None = None
         self._best_partial_answer: str | None = None
         self._completion_start_time: float | None = None  # Set when completion() starts
+        self._recursive_usage = UsageSummary(model_usage_summaries={})
+        self._recursive_usage_lock = Lock()
 
         # Persistence support
         self.persistent = persistent
@@ -335,7 +341,11 @@ class RLM:
         if self.other_backends and self.other_backend_kwargs:
             other_backend_client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
 
-        lm_handler = LMHandler(client, other_backend_client=other_backend_client)
+        lm_handler = LMHandler(
+            client,
+            other_backend_client=other_backend_client,
+            batch_max_concurrent=self.batch_max_concurrent,
+        )
 
         # Register other clients to be available as sub-call options (by model name).
         # Reuse other_backend_client for the first entry so each (backend, kwargs)
@@ -424,6 +434,52 @@ class RLM:
             )
         return message_history
 
+    @staticmethod
+    def _merge_usage_summaries(*summaries: UsageSummary) -> UsageSummary:
+        """Add per-model usage without losing same-model recursive calls."""
+        merged: dict[str, ModelUsageSummary] = {}
+        for summary in summaries:
+            for model, usage in summary.model_usage_summaries.items():
+                previous = merged.get(model)
+                if previous is None:
+                    merged[model] = ModelUsageSummary(
+                        total_calls=usage.total_calls,
+                        total_input_tokens=usage.total_input_tokens,
+                        total_output_tokens=usage.total_output_tokens,
+                        total_cost=usage.total_cost,
+                    )
+                    continue
+                costs = [
+                    value
+                    for value in (previous.total_cost, usage.total_cost)
+                    if value is not None
+                ]
+                merged[model] = ModelUsageSummary(
+                    total_calls=previous.total_calls + usage.total_calls,
+                    total_input_tokens=(
+                        previous.total_input_tokens + usage.total_input_tokens
+                    ),
+                    total_output_tokens=(
+                        previous.total_output_tokens + usage.total_output_tokens
+                    ),
+                    total_cost=sum(costs) if costs else None,
+                )
+        return UsageSummary(model_usage_summaries=merged)
+
+    def _record_recursive_usage(self, usage: UsageSummary) -> None:
+        """Accumulate a completed child's full root-and-leaf usage thread-safely."""
+        with self._recursive_usage_lock:
+            self._recursive_usage = self._merge_usage_summaries(
+                self._recursive_usage, usage
+            )
+
+    def _combined_usage(self, lm_handler: LMHandler) -> UsageSummary:
+        """Return direct client usage plus every completed recursive child."""
+        direct = lm_handler.get_usage_summary()
+        with self._recursive_usage_lock:
+            recursive = self._recursive_usage
+        return self._merge_usage_summaries(direct, recursive)
+
     def completion(
         self, prompt: str | dict[str, Any], root_prompt: str | None = None
     ) -> RLMChatCompletion:
@@ -447,6 +503,8 @@ class RLM:
         self._consecutive_errors = 0
         self._last_error = None
         self._best_partial_answer = None
+        with self._recursive_usage_lock:
+            self._recursive_usage = UsageSummary(model_usage_summaries={})
         # If we're at max depth, the RLM is an LM, so we fallback to the regular LM.
         if self.depth >= self.max_depth:
             return self._fallback_answer(prompt)
@@ -558,7 +616,7 @@ class RLM:
                         elif self.recover_stub:
                             final_answer = self._recover_if_stub(final_answer, environment)
                         time_end = time.perf_counter()
-                        usage = lm_handler.get_usage_summary()
+                        usage = self._combined_usage(lm_handler)
                         self.verbose.print_final_answer(final_answer)
                         self.verbose.print_summary(i + 1, time_end - time_start, usage.to_dict())
 
@@ -592,10 +650,26 @@ class RLM:
 
             except KeyboardInterrupt:
                 self.verbose.print_limit_exceeded("cancelled", "User interrupted execution")
-                raise CancellationError(
+                error = CancellationError(
                     partial_answer=self._best_partial_answer,
                     message="Execution cancelled by user (Ctrl+C)",
-                ) from None
+                )
+                error.usage_summary = self._combined_usage(lm_handler)
+                error.execution_time = time.perf_counter() - time_start
+                raise error from None
+            except (
+                TimeoutExceededError,
+                TokenLimitExceededError,
+                BudgetExceededError,
+                ErrorThresholdExceededError,
+                CancellationError,
+            ) as error:
+                # Limit-bound runs are model outcomes, not free attempts. Preserve
+                # all direct and completed-recursive usage so the harness can keep
+                # their token accounting valid instead of reporting false zeros.
+                error.usage_summary = self._combined_usage(lm_handler)
+                error.execution_time = time.perf_counter() - time_start
+                raise
 
             # Default behavior: we run out of iterations, provide one final answer.
             # The model never finalized. When ``fabricate_final_answer`` (default),
@@ -633,7 +707,7 @@ class RLM:
                 else:
                     final_deliverables = None
                     final_answer = ""
-            usage = lm_handler.get_usage_summary()
+            usage = self._combined_usage(lm_handler)
             self.verbose.print_final_answer(final_answer)
             self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
 
@@ -768,7 +842,7 @@ class RLM:
 
         # Check budget
         if self.max_budget is not None:
-            current_usage = lm_handler.get_usage_summary()
+            current_usage = self._combined_usage(lm_handler)
             current_cost = current_usage.total_cost or 0.0
             self._cumulative_cost = current_cost
             if self._cumulative_cost > self.max_budget:
@@ -785,7 +859,7 @@ class RLM:
 
         # Check token limit
         if self.max_tokens is not None:
-            current_usage = lm_handler.get_usage_summary()
+            current_usage = self._combined_usage(lm_handler)
             total_tokens = current_usage.total_input_tokens + current_usage.total_output_tokens
             if total_tokens > self.max_tokens:
                 self.verbose.print_limit_exceeded(
@@ -1065,6 +1139,7 @@ class RLM:
             custom_sub_tools=self.custom_sub_tools,
             # Propagate concurrency settings to children
             max_concurrent_subcalls=self.max_concurrent_subcalls,
+            batch_max_concurrent=self.batch_max_concurrent,
             # Propagate callbacks to children for nested tracking
             on_subcall_start=self.on_subcall_start,
             on_subcall_complete=self.on_subcall_complete,
@@ -1080,6 +1155,10 @@ class RLM:
                 "paraphrase, or echo the instruction, the role description, or the task itself."
             )
             result = child.completion(prompt, root_prompt=_child_directive)
+            # A recursive child owns a separate LMHandler, so its GLM/Qwen
+            # usage is invisible to the parent's direct clients unless we
+            # explicitly fold the completed child's full summary upward.
+            self._record_recursive_usage(result.usage_summary)
             # Track child's cost in parent's cumulative cost
             if result.usage_summary and result.usage_summary.total_cost:
                 self._cumulative_cost += result.usage_summary.total_cost
@@ -1087,21 +1166,31 @@ class RLM:
         except BudgetExceededError as e:
             # Propagate child's spending to parent
             self._cumulative_cost += e.spent
+            usage = getattr(e, "usage_summary", None) or UsageSummary(
+                model_usage_summaries={}
+            )
+            self._record_recursive_usage(usage)
             error_msg = f"Budget exceeded - {e}"
             return RLMChatCompletion(
                 root_model=resolved_model,
                 prompt=prompt,
                 response=f"Error: Child RLM budget exceeded - {e}",
-                usage_summary=UsageSummary(model_usage_summaries={}),
+                usage_summary=usage,
                 execution_time=time.perf_counter() - subcall_start,
             )
         except Exception as e:
+            usage = getattr(e, "usage_summary", None) or UsageSummary(
+                model_usage_summaries={}
+            )
+            self._record_recursive_usage(usage)
+            if usage.total_cost:
+                self._cumulative_cost += usage.total_cost
             error_msg = str(e)
             return RLMChatCompletion(
                 root_model=resolved_model,
                 prompt=prompt,
                 response=f"Error: Child RLM completion failed - {e}",
-                usage_summary=UsageSummary(model_usage_summaries={}),
+                usage_summary=usage,
                 execution_time=time.perf_counter() - subcall_start,
             )
         finally:
