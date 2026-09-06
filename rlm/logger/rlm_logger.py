@@ -5,6 +5,7 @@ Captures run metadata and iterations in memory so they can be attached to
 RLMChatCompletion.metadata. Optionally writes the same data to JSON-lines files.
 """
 
+import copy
 import json
 import os
 import uuid
@@ -21,9 +22,26 @@ class RLMLogger:
     - log_dir=None: trajectory is available via get_trajectory() and can be
       attached to RLMChatCompletion.metadata (no disk write).
     - log_dir="path": same capture plus appends to a JSONL file per run.
+    - include_locals=False: omit diagnostic locals before serialization.
+    - child_log_dir="path": save each child's full I/O in a separate durable file.
+    - log_model_responses=True: also persist disk-only model I/O before code runs.
     """
 
-    def __init__(self, log_dir: str | None = None, file_name: str = "rlm"):
+    def __init__(
+        self,
+        log_dir: str | None = None,
+        file_name: str = "rlm",
+        *,
+        include_locals: bool = True,
+        child_log_dir: str | None = None,
+        helper_call_id: str | None = None,
+        log_model_responses: bool = False,
+    ):
+        # Diagnostic policies only; none of these change live REPL state or feedback.
+        self.include_locals = include_locals
+        self.child_log_dir = child_log_dir
+        self.helper_call_id = helper_call_id
+        self.log_model_responses = log_model_responses
         self._save_to_disk = log_dir is not None
         self.log_dir = log_dir
         self.log_file_path: str | None = None
@@ -38,12 +56,61 @@ class RLMLogger:
         self._iteration_count = 0
         self._metadata_logged = False
 
+    def child_logger(self, helper_call_id: str | None = None) -> "RLMLogger":
+        """Give every child the same policy and optional flat child-only directory."""
+        return RLMLogger(
+            log_dir=self.child_log_dir,
+            include_locals=self.include_locals,
+            child_log_dir=self.child_log_dir,
+            helper_call_id=helper_call_id,
+            log_model_responses=self.log_model_responses,
+        )
+
+    def logging_metadata(self) -> dict:
+        """Record nondefault diagnostic policy and link a child file to its helper."""
+        fields = {}
+        if not self.include_locals:
+            fields["include_locals"] = False
+        if self.log_model_responses:
+            fields["log_model_responses"] = True
+        if self.child_log_dir is not None:
+            fields["child_log_dir"] = self.child_log_dir
+            fields["log_file_path"] = self.log_file_path
+        if self.helper_call_id is not None:
+            fields["helper_call_id"] = self.helper_call_id
+        return fields
+
+    def write_entry(self, entry: dict, *, durable: bool = False) -> None:
+        """Append one record; diagnostic child turns survive a client-process kill."""
+        if self._save_to_disk and self.log_file_path:
+            with open(self.log_file_path, "a") as stream:
+                json.dump(entry, stream)
+                stream.write("\n")
+                if durable or (
+                    self.child_log_dir is not None and self.log_dir == self.child_log_dir
+                ):
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+    def log_model_response(self, iteration: RLMIteration) -> None:
+        """Persist received model I/O before code runs, without counting an iteration."""
+        if self.log_model_responses and self._save_to_disk:
+            self.write_entry(
+                {
+                    "type": "model_response",
+                    "iteration": self._iteration_count + 1,
+                    "timestamp": datetime.now().isoformat(),
+                    **iteration.to_dict(include_locals=False),
+                },
+                durable=True,
+            )
+
     def log_metadata(self, metadata: RLMMetadata) -> None:
         """Capture run metadata (and optionally write to file)."""
         if self._metadata_logged:
             return
 
-        self._run_metadata = metadata.to_dict()
+        self._run_metadata = copy.deepcopy({**metadata.to_dict(), **self.logging_metadata()})
         self._metadata_logged = True
 
         if self._save_to_disk and self.log_file_path:
@@ -52,9 +119,7 @@ class RLMLogger:
                 "timestamp": datetime.now().isoformat(),
                 **self._run_metadata,
             }
-            with open(self.log_file_path, "a") as f:
-                json.dump(entry, f)
-                f.write("\n")
+            self.write_entry(entry)
 
     def log(self, iteration: RLMIteration) -> None:
         """Capture one iteration (and optionally append to file)."""
@@ -63,14 +128,14 @@ class RLMLogger:
             "type": "iteration",
             "iteration": self._iteration_count,
             "timestamp": datetime.now().isoformat(),
-            **iteration.to_dict(),
+            **iteration.to_dict(include_locals=self.include_locals),
         }
+        # Deferred child trajectories must retain the prompt/metadata as seen
+        # at this turn, not references mutated by later history extensions.
+        entry = copy.deepcopy(entry)
         self._iterations.append(entry)
 
-        if self._save_to_disk and self.log_file_path:
-            with open(self.log_file_path, "a") as f:
-                json.dump(entry, f)
-                f.write("\n")
+        self.write_entry(entry)
 
     def clear_iterations(self) -> None:
         """Reset iterations for the next completion (trajectory is per completion)."""

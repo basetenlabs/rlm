@@ -25,6 +25,7 @@ sub-call HTTP attempt, SDK retries included since the slot wraps the call):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import os
@@ -68,6 +69,36 @@ class GlobalSubcallGate:
                     f"{_ACQUIRE_TIMEOUT_S:.0f}s ({self.limit} slots at {self.dir})"
                 )
             time.sleep(random.uniform(0.05, 0.30))  # doubles as launch jitter
+
+    @contextlib.asynccontextmanager
+    async def async_slot(self):
+        """Acquire without a background thread; cancellation cannot acquire later."""
+        deadline = time.monotonic() + _ACQUIRE_TIMEOUT_S
+        indices = list(range(self.limit))
+        while True:
+            random.shuffle(indices)
+            for i in indices:
+                fd = os.open(os.path.join(self.dir, f"slot_{i:03d}.lock"),
+                             os.O_CREAT | os.O_RDWR, 0o644)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    os.close(fd)
+                    continue
+                # No await between acquisition and the finally-protected yield.
+                try:
+                    yield
+                finally:
+                    with contextlib.suppress(OSError):
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                return
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"global sub-call gate: no slot free within "
+                    f"{_ACQUIRE_TIMEOUT_S:.0f}s ({self.limit} slots at {self.dir})"
+                )
+            await asyncio.sleep(random.uniform(0.05, 0.30))
 
 
 _GATE: GlobalSubcallGate | None = None

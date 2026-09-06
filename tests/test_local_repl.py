@@ -1,8 +1,138 @@
 """Comprehensive tests for LocalREPL environment."""
 
 import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from threading import Barrier
+from unittest.mock import Mock
 
-from rlm.environments.local_repl import LocalREPL
+import pytest
+
+import rlm.environments.local_repl as local_repl_module
+from rlm.core.rlm import RLM
+from rlm.core.types import UsageSummary
+from rlm.environments.local_repl import LocalREPL, _ThreadRoutedStream
+
+
+class TestNestedCapture:
+    @pytest.fixture(autouse=True)
+    def fresh_stream_routers(self, monkeypatch):
+        # Pytest replaces process streams between tests; give each test a fresh
+        # production router and restore the process streams after it finishes.
+        monkeypatch.setattr(local_repl_module, "_STREAM_ROUTERS", None)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            yield
+
+    @pytest.mark.parametrize(
+        "query, count",
+        [
+            ("rlm_query('question')", 1),
+            ("rlm_query_batched(['question'])", 1),
+            ("rlm_query_batched(['question', 'question'])", 2),
+        ],
+    )
+    @pytest.mark.parametrize("child_error", [False, True])
+    def test_child_restores_parent_stdout_and_stderr(self, monkeypatch, query, count, child_error):
+        barrier = Barrier(count)
+        client = Mock(model_name="mock-model")
+        ending = (
+            "raise ValueError('child failed')"
+            if child_error
+            else "answer['content'] = 'child'; answer['ready'] = True"
+        )
+
+        def completion(*args):
+            barrier.wait(timeout=5)
+            return (
+                "```repl\nimport sys\nprint('child stdout')\n"
+                "print('child stderr', file=sys.stderr)\n" + ending + "\n```"
+            )
+
+        client.completion.side_effect = completion
+        client.get_usage_summary.return_value = UsageSummary(model_usage_summaries={})
+        monkeypatch.setattr("rlm.core.rlm.get_client", lambda *args: client)
+        parent = RLM(
+            backend_kwargs={"model_name": "mock-model"},
+            max_depth=2,
+            max_iterations=1,
+            fabricate_final_answer=False,
+            recover_stub=False,
+        )
+        try:
+            with LocalREPL(subcall_fn=parent._subcall) as env:
+                result = env.execute_code(
+                    "import sys\nprint('parent before')\n"
+                    "print('parent stderr before', file=sys.stderr)\n"
+                    f"x = {query}\nprint('parent after')\n"
+                    "print('parent stderr after', file=sys.stderr)"
+                )
+                following = env.execute_code("print('next block')")
+        finally:
+            parent.close()
+        assert client.completion.call_count == count
+        assert result.stdout == "parent before\nparent after\n"
+        assert result.stderr == "parent stderr before\nparent stderr after\n"
+        assert following.stdout == "next block\n"
+
+    def test_nested_capture_exception_restores_outer_and_fallback_streams(self):
+        fallback_out, fallback_err = StringIO(), StringIO()
+        with (
+            redirect_stdout(fallback_out),
+            redirect_stderr(fallback_err),
+            LocalREPL() as outer,
+            LocalREPL() as inner,
+        ):
+            with outer._capture_output() as (outer_out, outer_err):
+                print("outer before")
+                print("outer error before", file=sys.stderr)
+                with pytest.raises(ValueError, match="nested"):
+                    with inner._capture_output() as (inner_out, inner_err):
+                        print("inner")
+                        print("inner error", file=sys.stderr)
+                        raise ValueError("nested")
+                print("outer after")
+                print("outer error after", file=sys.stderr)
+            print("fallback")
+            print("fallback error", file=sys.stderr)
+        assert outer_out.getvalue() == "outer before\nouter after\n"
+        assert outer_err.getvalue() == "outer error before\nouter error after\n"
+        assert inner_out.getvalue() == "inner\n"
+        assert inner_err.getvalue() == "inner error\n"
+        assert fallback_out.getvalue() == "fallback\n"
+        assert fallback_err.getvalue() == "fallback error\n"
+
+    def test_parallel_nested_routes_restore_their_own_parent(self):
+        fallback, parent = StringIO(), StringIO()
+        stream = _ThreadRoutedStream(fallback)
+        stream.register(parent)
+        barrier = Barrier(2)
+
+        def worker(label):
+            outer, inner = StringIO(), StringIO()
+            stream.register(outer)
+            stream.write(f"{label} before\n")
+            stream.register(inner)
+            barrier.wait(timeout=5)
+            stream.write(f"{label} child\n")
+            stream.unregister()
+            barrier.wait(timeout=5)
+            stream.write(f"{label} after\n")
+            stream.unregister()
+            return outer.getvalue(), inner.getvalue()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(worker, ("a", "b")))
+        stream.write("main\n")
+        stream.unregister()
+        stream.write("fallback\n")
+        assert results == [
+            ("a before\na after\n", "a child\n"),
+            ("b before\nb after\n", "b child\n"),
+        ]
+        assert parent.getvalue() == "main\n"
+        assert fallback.getvalue() == "fallback\n"
 
 
 class TestLocalREPLBasic:

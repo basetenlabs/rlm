@@ -1,15 +1,24 @@
+import copy
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
+from threading import Lock
 from typing import Any
 
 from rlm.clients import BaseLM, get_client
+from rlm.core.comms_utils import (
+    DEFAULT_WAVE_TIMEOUT,
+    WAVE_TIMEOUT_SLACK,
+    LMRequest,
+    send_lm_request,
+)
 from rlm.core.lm_handler import LMHandler
 from rlm.core.types import (
     DEFAULT_DELIVERABLE_SLOT,
     ClientBackend,
     CodeBlock,
     EnvironmentType,
+    ModelUsageSummary,
     REPLResult,
     RLMChatCompletion,
     RLMIteration,
@@ -18,6 +27,7 @@ from rlm.core.types import (
     render_deliverables,
 )
 from rlm.environments import BaseEnv, SupportsPersistence, get_environment
+from rlm.environments.local_repl import current_helper_call_id
 from rlm.logger import RLMLogger, VerbosePrinter
 from rlm.utils.exceptions import (
     BudgetExceededError,
@@ -32,14 +42,24 @@ from rlm.utils.parsing import (
     format_iteration,
 )
 from rlm.utils.prompts import (
-    RLM_SYSTEM_PROMPT,
-    RLM_SYSTEM_PROMPT_SLOTS,
     QueryMetadata,
     build_rlm_system_prompt,
     build_user_prompt,
 )
 from rlm.utils.rlm_utils import filter_sensitive_keys
 from rlm.utils.token_utils import count_tokens, get_context_limit
+
+
+def failure_usage_metadata(usage: UsageSummary) -> dict[str, str]:
+    """Observed partial usage never proves that failed work consumed nothing else."""
+    observed = any(
+        entry.total_calls
+        or entry.total_input_tokens
+        or entry.total_output_tokens
+        or entry.total_cost
+        for entry in usage.model_usage_summaries.values()
+    )
+    return {"usage_status": "observed_partial" if observed else "unknown"}
 
 
 def _capture_root_usage(lm_handler) -> dict[str, int] | None:
@@ -116,6 +136,7 @@ class RLM:
         compaction: bool = False,
         compaction_threshold_pct: float = 0.85,
         max_concurrent_subcalls: int = 4,
+        batch_max_concurrent: int = 16,
         on_subcall_start: Callable[[int, str, str], None] | None = None,
         on_subcall_complete: Callable[[int, str, float, str | None], None] | None = None,
         on_iteration_start: Callable[[int, int], None] | None = None,
@@ -130,6 +151,7 @@ class RLM:
         deliverable_slots: list[str] | None = None,
         fabricate_final_answer: bool = True,
         recover_stub: bool = True,
+        fixed_model_routing: bool = False,
     ):
         """
         Args:
@@ -180,6 +202,9 @@ class RLM:
                 when the finalized text looks like a stub. When False, use the finalized value
                 as-is (no largest-string grab), which avoids accidentally grabbing an input
                 document a model copied into a variable.
+            fixed_model_routing: Lock recursive RLMs to the main backend and all flat
+                leaves to the first other backend, regardless of environment depth.
+                Reject conflicting explicit model overrides. False preserves legacy routing.
         """
         # Sampling args plumbed into backend_kwargs / other_backend_kwargs
         # before the clients are constructed, so they reach the chat-completions
@@ -222,6 +247,16 @@ class RLM:
 
         self.other_backends = other_backends
         self.other_backend_kwargs = other_backend_kwargs
+        self.fixed_model_routing = fixed_model_routing
+        if fixed_model_routing and environment == "local":
+            self.environment_kwargs["record_failed_calls"] = True
+        if fixed_model_routing and not (
+            (backend_kwargs or {}).get("model_name")
+            and other_backends
+            and other_backend_kwargs
+            and other_backend_kwargs[0].get("model_name")
+        ):
+            raise ValueError("fixed_model_routing requires explicit root and leaf model backends")
 
         # Custom tools: functions available in the REPL environment
         self.custom_tools = custom_tools
@@ -231,6 +266,7 @@ class RLM:
         self.compaction = compaction
         self.compaction_threshold_pct = compaction_threshold_pct
         self.max_concurrent_subcalls = max_concurrent_subcalls
+        self.batch_max_concurrent = batch_max_concurrent
 
         self.depth = depth
         self.max_depth = max_depth
@@ -290,6 +326,8 @@ class RLM:
         self._last_error: str | None = None
         self._best_partial_answer: str | None = None
         self._completion_start_time: float | None = None  # Set when completion() starts
+        self._recursive_usage = UsageSummary(model_usage_summaries={})
+        self._recursive_usage_lock = Lock()
 
         # Persistence support
         self.persistent = persistent
@@ -335,7 +373,12 @@ class RLM:
         if self.other_backends and self.other_backend_kwargs:
             other_backend_client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
 
-        lm_handler = LMHandler(client, other_backend_client=other_backend_client)
+        lm_handler = LMHandler(
+            client,
+            other_backend_client=other_backend_client,
+            batch_max_concurrent=self.batch_max_concurrent,
+            fixed_model_routing=self.fixed_model_routing,
+        )
 
         # Register other clients to be available as sub-call options (by model name).
         # Reuse other_backend_client for the first entry so each (backend, kwargs)
@@ -424,6 +467,44 @@ class RLM:
             )
         return message_history
 
+    @staticmethod
+    def _merge_usage_summaries(*summaries: UsageSummary) -> UsageSummary:
+        """Add per-model usage without losing same-model recursive calls."""
+        merged: dict[str, ModelUsageSummary] = {}
+        for summary in summaries:
+            for model, usage in summary.model_usage_summaries.items():
+                previous = merged.get(model)
+                if previous is None:
+                    merged[model] = ModelUsageSummary(
+                        total_calls=usage.total_calls,
+                        total_input_tokens=usage.total_input_tokens,
+                        total_output_tokens=usage.total_output_tokens,
+                        total_cost=usage.total_cost,
+                    )
+                    continue
+                costs = [
+                    value for value in (previous.total_cost, usage.total_cost) if value is not None
+                ]
+                merged[model] = ModelUsageSummary(
+                    total_calls=previous.total_calls + usage.total_calls,
+                    total_input_tokens=(previous.total_input_tokens + usage.total_input_tokens),
+                    total_output_tokens=(previous.total_output_tokens + usage.total_output_tokens),
+                    total_cost=sum(costs) if costs else None,
+                )
+        return UsageSummary(model_usage_summaries=merged)
+
+    def _record_recursive_usage(self, usage: UsageSummary) -> None:
+        """Accumulate a completed child's full root-and-leaf usage thread-safely."""
+        with self._recursive_usage_lock:
+            self._recursive_usage = self._merge_usage_summaries(self._recursive_usage, usage)
+
+    def _combined_usage(self, lm_handler: LMHandler) -> UsageSummary:
+        """Return direct client usage plus every completed recursive child."""
+        direct = lm_handler.get_usage_summary()
+        with self._recursive_usage_lock:
+            recursive = self._recursive_usage
+        return self._merge_usage_summaries(direct, recursive)
+
     def completion(
         self, prompt: str | dict[str, Any], root_prompt: str | None = None
     ) -> RLMChatCompletion:
@@ -447,6 +528,8 @@ class RLM:
         self._consecutive_errors = 0
         self._last_error = None
         self._best_partial_answer = None
+        with self._recursive_usage_lock:
+            self._recursive_usage = UsageSummary(model_usage_summaries={})
         # If we're at max depth, the RLM is an LM, so we fallback to the regular LM.
         if self.depth >= self.max_depth:
             return self._fallback_answer(prompt)
@@ -558,7 +641,7 @@ class RLM:
                         elif self.recover_stub:
                             final_answer = self._recover_if_stub(final_answer, environment)
                         time_end = time.perf_counter()
-                        usage = lm_handler.get_usage_summary()
+                        usage = self._combined_usage(lm_handler)
                         self.verbose.print_final_answer(final_answer)
                         self.verbose.print_summary(i + 1, time_end - time_start, usage.to_dict())
 
@@ -592,10 +675,26 @@ class RLM:
 
             except KeyboardInterrupt:
                 self.verbose.print_limit_exceeded("cancelled", "User interrupted execution")
-                raise CancellationError(
+                error = CancellationError(
                     partial_answer=self._best_partial_answer,
                     message="Execution cancelled by user (Ctrl+C)",
-                ) from None
+                )
+                error.usage_summary = self._combined_usage(lm_handler)
+                error.execution_time = time.perf_counter() - time_start
+                raise error from None
+            except (
+                TimeoutExceededError,
+                TokenLimitExceededError,
+                BudgetExceededError,
+                ErrorThresholdExceededError,
+                CancellationError,
+            ) as error:
+                # Limit-bound runs are model outcomes, not free attempts. Preserve
+                # all direct and completed-recursive usage so the harness can keep
+                # their token accounting valid instead of reporting false zeros.
+                error.usage_summary = self._combined_usage(lm_handler)
+                error.execution_time = time.perf_counter() - time_start
+                raise
 
             # Default behavior: we run out of iterations, provide one final answer.
             # The model never finalized. When ``fabricate_final_answer`` (default),
@@ -614,9 +713,7 @@ class RLM:
                     slots = self._resolve_slots(environment)
                     final_deliverables = {name: fallback for name in slots}
                     if self.recover_stub:
-                        final_deliverables = self._recover_if_stub(
-                            final_deliverables, environment
-                        )
+                        final_deliverables = self._recover_if_stub(final_deliverables, environment)
                     final_answer = render_deliverables(final_deliverables)
                 else:
                     final_deliverables = None
@@ -633,7 +730,7 @@ class RLM:
                 else:
                     final_deliverables = None
                     final_answer = ""
-            usage = lm_handler.get_usage_summary()
+            usage = self._combined_usage(lm_handler)
             self.verbose.print_final_answer(final_answer)
             self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
 
@@ -685,9 +782,7 @@ class RLM:
         if isinstance(answer, dict):
             if not answer:
                 return answer
-            return {
-                name: self._recover_slot(text, locals_) for name, text in answer.items()
-            }
+            return {name: self._recover_slot(text, locals_) for name, text in answer.items()}
         if answer is None:
             return answer
         recovered = self._recover_slot(answer, locals_)
@@ -768,7 +863,7 @@ class RLM:
 
         # Check budget
         if self.max_budget is not None:
-            current_usage = lm_handler.get_usage_summary()
+            current_usage = self._combined_usage(lm_handler)
             current_cost = current_usage.total_cost or 0.0
             self._cumulative_cost = current_cost
             if self._cumulative_cost > self.max_budget:
@@ -785,7 +880,7 @@ class RLM:
 
         # Check token limit
         if self.max_tokens is not None:
-            current_usage = lm_handler.get_usage_summary()
+            current_usage = self._combined_usage(lm_handler)
             total_tokens = current_usage.total_input_tokens + current_usage.total_output_tokens
             if total_tokens > self.max_tokens:
                 self.verbose.print_limit_exceeded(
@@ -882,6 +977,17 @@ class RLM:
         root_usage = _capture_root_usage(lm_handler)
         finish_reason = _capture_finish_reason(lm_handler)
         reasoning_content = _capture_reasoning_content(lm_handler)
+        if self.logger:
+            self.logger.log_model_response(
+                RLMIteration(
+                    prompt=prompt,
+                    response=response,
+                    code_blocks=[],
+                    root_usage=root_usage,
+                    finish_reason=finish_reason,
+                    reasoning_content=reasoning_content,
+                )
+            )
         code_block_strs = find_code_blocks(response)
         code_blocks = []
 
@@ -935,6 +1041,8 @@ class RLM:
         """
         Fallback behavior if the RLM is actually at max depth, and should be treated as an LM.
         """
+        if self.fixed_model_routing:
+            return self._subcall(message).response
         client: BaseLM = get_client(self.backend, self.backend_kwargs)
         response = client.completion(message)
         return response
@@ -957,6 +1065,19 @@ class RLM:
             On error, returns a completion with the error message as the response.
         """
         next_depth = self.depth + 1
+        if self.fixed_model_routing:
+            terminal = next_depth >= self.max_depth
+            expected_model = (
+                self.other_backend_kwargs[0]["model_name"]
+                if terminal
+                else self.backend_kwargs["model_name"]
+            )
+            role = "terminal leaf rlm_query/rlm_query_batched" if terminal else "recursive RLM"
+            if model is not None and model != expected_model:
+                raise ValueError(
+                    f"fixed_model_routing: {role} permits only model {expected_model!r}; "
+                    f"received {model!r}"
+                )
 
         # Determine which backend/kwargs to use (model override or parent's default)
         if model is not None:
@@ -966,8 +1087,100 @@ class RLM:
             child_backend_kwargs = self.backend_kwargs
         resolved_model = model or (child_backend_kwargs or {}).get("model_name", "unknown")
 
+        # Strict leaves also obey pre-dispatch limits. Legacy leaves retain
+        # their historical early-return behavior below.
+        remaining_budget = None
+        remaining_timeout = None
+        if self.fixed_model_routing or next_depth < self.max_depth:
+            if self.max_budget is not None:
+                remaining_budget = self.max_budget - self._cumulative_cost
+                if remaining_budget <= 0:
+                    return RLMChatCompletion(
+                        root_model=expected_model if self.fixed_model_routing else resolved_model,
+                        prompt=prompt,
+                        response=(
+                            "Error: Budget exhausted "
+                            f"(spent ${self._cumulative_cost:.6f} of ${self.max_budget:.6f})"
+                        ),
+                        usage_summary=UsageSummary(model_usage_summaries={}),
+                        execution_time=0.0,
+                        error="Budget exhausted" if self.fixed_model_routing else None,
+                        metadata={"usage_status": "unknown"} if self.fixed_model_routing else None,
+                    )
+            if self.max_timeout is not None and self._completion_start_time is not None:
+                elapsed = time.perf_counter() - self._completion_start_time
+                remaining_timeout = self.max_timeout - elapsed
+                if remaining_timeout <= 0:
+                    return RLMChatCompletion(
+                        root_model=expected_model if self.fixed_model_routing else resolved_model,
+                        prompt=prompt,
+                        response=f"Error: Timeout exhausted ({elapsed:.1f}s of {self.max_timeout:.1f}s)",
+                        usage_summary=UsageSummary(model_usage_summaries={}),
+                        execution_time=0.0,
+                        error="Timeout exhausted" if self.fixed_model_routing else None,
+                        metadata={"usage_status": "unknown"} if self.fixed_model_routing else None,
+                    )
+
         # If we'd hit/exceed the cap, do a normal LM completion (no REPL)
         if next_depth >= self.max_depth:
+            if self.fixed_model_routing:
+                start_time = time.perf_counter()
+                client = None
+                try:
+                    client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
+                    # A dedicated handler owns this client's async lifecycle.
+                    # Both roles name the same leaf; depth 0 selects it without
+                    # changing any parent handler's routing state.
+                    with LMHandler(
+                        client,
+                        other_backend_client=client,
+                        fixed_model_routing=True,
+                        batch_max_concurrent=self.batch_max_concurrent,
+                    ) as leaf_handler:
+                        response = send_lm_request(
+                            leaf_handler.address,
+                            LMRequest(prompt=prompt, model=expected_model, depth=0),
+                            timeout=int(DEFAULT_WAVE_TIMEOUT + WAVE_TIMEOUT_SLACK),
+                        )
+                    if response.chat_completion is None:
+                        raise RuntimeError(response.error or "Missing terminal completion")
+                    result = copy.copy(response.chat_completion)
+                    if not response.success:
+                        result.error = response.error
+                        result.response = f"Error: {response.error}"
+                        result.metadata = {
+                            **failure_usage_metadata(result.usage_summary),
+                            **(result.metadata or {}),
+                        }
+                except Exception as exc:
+                    usage = UsageSummary(model_usage_summaries={})
+                    usage_error = None
+                    if client is not None:
+                        try:
+                            usage = client.get_usage_summary()
+                        except Exception as collection_error:
+                            usage_error = str(collection_error)
+                    result = RLMChatCompletion(
+                        root_model=expected_model,
+                        prompt=prompt,
+                        response=f"Error: LM query failed at max depth - {exc}",
+                        usage_summary=usage,
+                        execution_time=time.perf_counter() - start_time,
+                        error=str(exc),
+                        metadata={
+                            **failure_usage_metadata(usage),
+                            **(
+                                {"usage_collection_error": usage_error}
+                                if usage_error is not None
+                                else {}
+                            ),
+                        },
+                    )
+                # Every outcome is folded once, including failures that carry
+                # provider-observed partial usage. No cumulative double fold.
+                self._record_recursive_usage(result.usage_summary)
+                return result
+
             # Use other_backend if available, otherwise use main backend
             if self.other_backends and self.other_backend_kwargs:
                 client = get_client(self.other_backends[0], self.other_backend_kwargs[0])
@@ -989,42 +1202,13 @@ class RLM:
                 )
             except Exception as e:
                 end_time = time.perf_counter()
+                usage_summary = UsageSummary(model_usage_summaries={})
                 return RLMChatCompletion(
                     root_model=root_model,
                     prompt=prompt,
                     response=f"Error: LM query failed at max depth - {e}",
-                    usage_summary=UsageSummary(model_usage_summaries={}),
+                    usage_summary=usage_summary,
                     execution_time=end_time - start_time,
-                )
-
-        # Calculate remaining budget for child (if budget tracking enabled)
-        remaining_budget = None
-        if self.max_budget is not None:
-            remaining_budget = self.max_budget - self._cumulative_cost
-            if remaining_budget <= 0:
-                return RLMChatCompletion(
-                    root_model=resolved_model,
-                    prompt=prompt,
-                    response=(
-                        "Error: Budget exhausted "
-                        f"(spent ${self._cumulative_cost:.6f} of ${self.max_budget:.6f})"
-                    ),
-                    usage_summary=UsageSummary(model_usage_summaries={}),
-                    execution_time=0.0,
-                )
-
-        # Calculate remaining timeout for child (if timeout tracking enabled)
-        remaining_timeout = None
-        if self.max_timeout is not None and self._completion_start_time is not None:
-            elapsed = time.perf_counter() - self._completion_start_time
-            remaining_timeout = self.max_timeout - elapsed
-            if remaining_timeout <= 0:
-                return RLMChatCompletion(
-                    root_model=resolved_model,
-                    prompt=prompt,
-                    response=f"Error: Timeout exhausted ({elapsed:.1f}s of {self.max_timeout:.1f}s)",
-                    usage_summary=UsageSummary(model_usage_summaries={}),
-                    execution_time=0.0,
                 )
 
         # Resolve the model name for callbacks
@@ -1054,17 +1238,25 @@ class RLM:
             max_timeout=remaining_timeout,
             max_tokens=self.max_tokens,
             max_errors=self.max_errors,
-            custom_system_prompt=self.system_prompt,
+            fabricate_final_answer=self.fabricate_final_answer,
+            recover_stub=self.recover_stub,
+            fixed_model_routing=self.fixed_model_routing,
+            # Children return content, so slot parents' prompts (including custom
+            # prompts) must not teach them the parent's deliverable-slot protocol.
+            custom_system_prompt=None if self._slot_mode else self.system_prompt,
             other_backends=self.other_backends,
             other_backend_kwargs=self.other_backend_kwargs,
             # Give child its own logger so its trajectory is captured in metadata
-            logger=RLMLogger() if self.logger else None,
+            logger=self.logger.child_logger(helper_call_id=current_helper_call_id())
+            if self.logger
+            else None,
             verbose=False,
             # Propagate custom tools to children (sub_tools become the child's tools)
             custom_tools=self.custom_sub_tools,
             custom_sub_tools=self.custom_sub_tools,
             # Propagate concurrency settings to children
             max_concurrent_subcalls=self.max_concurrent_subcalls,
+            batch_max_concurrent=self.batch_max_concurrent,
             # Propagate callbacks to children for nested tracking
             on_subcall_start=self.on_subcall_start,
             on_subcall_complete=self.on_subcall_complete,
@@ -1079,7 +1271,19 @@ class RLM:
                 "fully over your context and return ONLY the requested output. Do NOT restate, "
                 "paraphrase, or echo the instruction, the role description, or the task itself."
             )
+            if self.fixed_model_routing:
+                leaf_model = self.other_backend_kwargs[0]["model_name"]
+                _child_directive += (
+                    f" Model routing is fixed: llm_query and llm_query_batched automatically use "
+                    f"the leaf model {leaf_model!r}; omit model= unless using that exact name. "
+                    f"Recursive RLMs must use {resolved_model!r}, or {leaf_model!r} at the depth cap. "
+                    "Conflicting model overrides are rejected."
+                )
             result = child.completion(prompt, root_prompt=_child_directive)
+            # A recursive child owns a separate LMHandler, so its GLM/Qwen
+            # usage is invisible to the parent's direct clients unless we
+            # explicitly fold the completed child's full summary upward.
+            self._record_recursive_usage(result.usage_summary)
             # Track child's cost in parent's cumulative cost
             if result.usage_summary and result.usage_summary.total_cost:
                 self._cumulative_cost += result.usage_summary.total_cost
@@ -1087,22 +1291,32 @@ class RLM:
         except BudgetExceededError as e:
             # Propagate child's spending to parent
             self._cumulative_cost += e.spent
+            usage = getattr(e, "usage_summary", None) or UsageSummary(model_usage_summaries={})
+            self._record_recursive_usage(usage)
             error_msg = f"Budget exceeded - {e}"
             return RLMChatCompletion(
                 root_model=resolved_model,
                 prompt=prompt,
                 response=f"Error: Child RLM budget exceeded - {e}",
-                usage_summary=UsageSummary(model_usage_summaries={}),
+                usage_summary=usage,
                 execution_time=time.perf_counter() - subcall_start,
+                error=str(e) if self.fixed_model_routing else None,
+                metadata=failure_usage_metadata(usage) if self.fixed_model_routing else None,
             )
         except Exception as e:
+            usage = getattr(e, "usage_summary", None) or UsageSummary(model_usage_summaries={})
+            self._record_recursive_usage(usage)
+            if usage.total_cost:
+                self._cumulative_cost += usage.total_cost
             error_msg = str(e)
             return RLMChatCompletion(
                 root_model=resolved_model,
                 prompt=prompt,
                 response=f"Error: Child RLM completion failed - {e}",
-                usage_summary=UsageSummary(model_usage_summaries={}),
+                usage_summary=usage,
                 execution_time=time.perf_counter() - subcall_start,
+                error=str(e) if self.fixed_model_routing else None,
+                metadata=failure_usage_metadata(usage) if self.fixed_model_routing else None,
             )
         finally:
             # Ensure child resources are cleaned up

@@ -240,11 +240,17 @@ class REPLResult:
     def __str__(self):
         return f"REPLResult(stdout={self.stdout}, stderr={self.stderr}, locals={self.locals}, execution_time={self.execution_time}, rlm_calls={len(self.rlm_calls)})"
 
-    def to_dict(self):
+    def to_dict(self, *, include_locals: bool = True):
+        # Omit before traversal: shared REPL objects can expand exponentially
+        # when serialized as a tree, even when a downstream logger drops locals.
         return {
             "stdout": self.stdout,
             "stderr": self.stderr,
-            "locals": {k: _serialize_value(v) for k, v in self.locals.items()},
+            **(
+                {"locals": {k: _serialize_value(v) for k, v in self.locals.items()}}
+                if include_locals
+                else {}
+            ),
             "execution_time": self.execution_time,
             "rlm_calls": [call.to_dict() for call in self.rlm_calls],
             "final_answer": self.final_answer,
@@ -257,8 +263,8 @@ class CodeBlock:
     code: str
     result: REPLResult
 
-    def to_dict(self):
-        return {"code": self.code, "result": self.result.to_dict()}
+    def to_dict(self, *, include_locals: bool = True):
+        return {"code": self.code, "result": self.result.to_dict(include_locals=include_locals)}
 
 
 @dataclass
@@ -282,11 +288,13 @@ class RLMIteration:
     # bounded size. None when the model doesn't emit reasoning or thinking is off.
     reasoning_content: str | None = None
 
-    def to_dict(self):
+    def to_dict(self, *, include_locals: bool = True):
         return {
             "prompt": self.prompt,
             "response": self.response,
-            "code_blocks": [code_block.to_dict() for code_block in self.code_blocks],
+            "code_blocks": [
+                code_block.to_dict(include_locals=include_locals) for code_block in self.code_blocks
+            ],
             "final_answer": self.final_answer,
             "iteration_time": self.iteration_time,
             "root_usage": self.root_usage,

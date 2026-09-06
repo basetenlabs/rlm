@@ -20,7 +20,7 @@ from rlm.core.comms_utils import (
     send_lm_request,
     send_lm_request_batched,
 )
-from rlm.core.types import DEFAULT_DELIVERABLE_SLOT, REPLResult, RLMChatCompletion
+from rlm.core.types import DEFAULT_DELIVERABLE_SLOT, REPLResult, RLMChatCompletion, UsageSummary
 from rlm.environments.base_env import (
     RESERVED_TOOL_NAMES,
     NonIsolatedEnv,
@@ -79,9 +79,7 @@ class _AnswerDict(dict):
             try:
                 if self._slot_mode:
                     deliverables = self.get("deliverables") or {}
-                    self._on_ready(
-                        dict(deliverables) if isinstance(deliverables, dict) else {}
-                    )
+                    self._on_ready(dict(deliverables) if isinstance(deliverables, dict) else {})
                 else:
                     self._on_ready(self.get("content", ""))
             except Exception:
@@ -91,6 +89,7 @@ class _AnswerDict(dict):
 # =============================================================================
 # Safe Builtins
 # =============================================================================
+
 
 # Safe builtins - blocks dangerous operations like eval/exec/input
 class _ThreadRoutedStream(io.TextIOBase):
@@ -103,19 +102,25 @@ class _ThreadRoutedStream(io.TextIOBase):
 
     def __init__(self, fallback: Any) -> None:
         self._fallback = fallback
-        self._routes: dict[int, Any] = {}
+        self._routes: dict[int, list[Any]] = {}
         self._routes_lock = threading.Lock()
 
     def register(self, buf: Any) -> None:
         with self._routes_lock:
-            self._routes[threading.get_ident()] = buf
+            self._routes.setdefault(threading.get_ident(), []).append(buf)
 
     def unregister(self) -> None:
         with self._routes_lock:
-            self._routes.pop(threading.get_ident(), None)
+            thread_id = threading.get_ident()
+            stack = self._routes.get(thread_id)
+            if stack:
+                stack.pop()
+                if not stack:
+                    del self._routes[thread_id]
 
     def _target(self) -> Any:
-        return self._routes.get(threading.get_ident(), self._fallback)
+        stack = self._routes.get(threading.get_ident())
+        return stack[-1] if stack else self._fallback
 
     def write(self, s: str) -> int:
         # A target can be closed by its owner (pytest capture teardown, a
@@ -152,6 +157,13 @@ class _ThreadRoutedStream(io.TextIOBase):
 
 _STREAM_ROUTERS: tuple[_ThreadRoutedStream, _ThreadRoutedStream] | None = None
 _STREAM_ROUTERS_LOCK = threading.Lock()
+_HELPER_EVENT_LOCK = threading.Lock()
+_HELPER_PARENT = threading.local()
+
+
+def current_helper_call_id() -> str | None:
+    """Read the active recursive dispatch ID for durable child-log correlation."""
+    return getattr(_HELPER_PARENT, "call_id", None)
 
 
 def _install_stream_routers() -> tuple[_ThreadRoutedStream, _ThreadRoutedStream]:
@@ -277,6 +289,8 @@ class LocalREPL(NonIsolatedEnv):
         compaction: bool = False,
         max_concurrent_subcalls: int = 4,
         deliverable_slots: list[str] | None = None,
+        record_failed_calls: bool = False,
+        helper_event_log: str | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -290,11 +304,10 @@ class LocalREPL(NonIsolatedEnv):
         # (upstream ``answer["content"]``); a list -> slot mode
         # (``answer["deliverables"]`` seeded with these names).
         self._slot_mode = deliverable_slots is not None
-        self.deliverable_slots = (
-            normalize_slots(deliverable_slots) if self._slot_mode else None
-        )
+        self.deliverable_slots = normalize_slots(deliverable_slots) if self._slot_mode else None
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn  # Callback for recursive RLM calls (depth > 1 support)
+        self.record_failed_calls = record_failed_calls
         # os.getcwd() raises FileNotFoundError when another concurrent LocalREPL's
         # cleanup() has rmtree'd the directory this process is standing in (chdir is
         # process-global; see _temp_cwd/cleanup). Fall back so init never wedges.
@@ -303,6 +316,7 @@ class LocalREPL(NonIsolatedEnv):
         except FileNotFoundError:
             self.original_cwd = tempfile.gettempdir()
             os.chdir(self.original_cwd)
+        self.helper_event_log = os.path.abspath(helper_event_log) if helper_event_log else None
         self.temp_dir = tempfile.mkdtemp(prefix=f"repl_env_{uuid.uuid4()}_")
         self._lock = threading.Lock()
         self._context_count: int = 0
@@ -376,9 +390,7 @@ class LocalREPL(NonIsolatedEnv):
 
     def _capture_answer(self, result) -> None:
         if self._slot_mode:
-            self._last_final_deliverables = {
-                str(k): str(v) for k, v in (result or {}).items()
-            }
+            self._last_final_deliverables = {str(k): str(v) for k, v in (result or {}).items()}
         else:
             self._last_final_answer = str(result) if result is not None else ""
 
@@ -402,6 +414,8 @@ class LocalREPL(NonIsolatedEnv):
             prompt: The prompt to send to the LM.
             model: Optional model name to use (if handler has multiple clients).
         """
+        if self.record_failed_calls or self.helper_event_log:
+            return self.record_helper_calls([prompt], model, "llm_query")[0]
         if not self.lm_handler_address:
             return "Error: No LM handler configured"
 
@@ -429,11 +443,16 @@ class LocalREPL(NonIsolatedEnv):
         Returns:
             List of responses in the same order as input prompts.
         """
+        if self.record_failed_calls or self.helper_event_log:
+            return self.record_helper_calls(prompts, model, "llm_query_batched")
         if not self.lm_handler_address:
             return ["Error: No LM handler configured"] * len(prompts)
         try:
             responses = send_lm_request_batched(
-                self.lm_handler_address, prompts, model=model, depth=self.depth,
+                self.lm_handler_address,
+                prompts,
+                model=model,
+                depth=self.depth,
                 timeout=int(DEFAULT_WAVE_TIMEOUT + WAVE_TIMEOUT_SLACK),
             )
 
@@ -460,6 +479,8 @@ class LocalREPL(NonIsolatedEnv):
             prompt: The prompt to send to the child RLM.
             model: Optional model name override for the child.
         """
+        if self.record_failed_calls or self.helper_event_log:
+            return self.record_helper_calls([prompt], model, "rlm_query")[0]
         if self.subcall_fn is not None:
             try:
                 completion = self.subcall_fn(prompt, model)
@@ -488,6 +509,8 @@ class LocalREPL(NonIsolatedEnv):
         Returns:
             List of responses in the same order as input prompts.
         """
+        if self.record_failed_calls or self.helper_event_log:
+            return self.record_helper_calls(prompts, model, "rlm_query_batched")
         if self.subcall_fn is not None:
             # For 0 or 1 prompts, no need for thread pool overhead
             if len(prompts) <= 1:
@@ -534,6 +557,155 @@ class LocalREPL(NonIsolatedEnv):
 
         # Fall back to plain batched LM call if no recursive capability
         return self._llm_query_batched(prompts, model)
+
+    def write_helper_event(self, event: dict[str, Any]) -> None:
+        """Durably append evidence; persistence failures must prevent dispatch/return.
+
+        Recursive REPLs share one process and this lock. A hard kill may leave a
+        partial final line, but a dispatched call already has a flushed start.
+        Use a separate absolute event path per room/process.
+        """
+        if self.helper_event_log:
+            line = json.dumps({**event, "timestamp": time.time()}) + "\n"
+            with _HELPER_EVENT_LOCK, open(self.helper_event_log, "a", encoding="utf-8") as stream:
+                stream.write(line)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+    def record_helper_calls(self, prompts: list[str], model: str | None, helper: str) -> list[str]:
+        """Opt-in helper evidence, keeping the legacy path unchanged by default."""
+        batched = helper.endswith("_batched")
+        recursive = helper.startswith("rlm_") and self.subcall_fn is not None
+        batch_id = str(uuid.uuid4())
+        starts = []
+        for index, prompt in enumerate(prompts):
+            event = {
+                "call_id": str(uuid.uuid4()),
+                "parent_call_id": getattr(_HELPER_PARENT, "call_id", None),
+                "batch_id": batch_id,
+                "batch_index": index,
+                "helper": helper,
+                "depth": self.depth,
+                "requested_model": model,
+                "prompt": copy.deepcopy(prompt),
+            }
+            self.write_helper_event({**event, "event": "started"})
+            starts.append((event, time.perf_counter()))
+        if not starts:
+            return []
+
+        def finish(index, outcome, error, completion=None):
+            event, started = starts[index]
+            elapsed = time.perf_counter() - started
+            original_response = completion.response if completion is not None else None
+            if completion is None:
+                completion = RLMChatCompletion(
+                    root_model=model or "unknown",
+                    prompt=prompts[index],
+                    response=outcome,
+                    usage_summary=UsageSummary(model_usage_summaries={}),
+                    execution_time=elapsed,
+                    error=error,
+                )
+            else:
+                completion = copy.copy(completion)
+            metadata = dict(completion.metadata or {})
+            metadata.setdefault("usage_status", "unknown" if error is not None else "reported")
+            provenance = {
+                **event,
+                "elapsed_seconds": elapsed,
+                "usage_status": metadata["usage_status"],
+                "completion_response": original_response,
+            }
+            completion.response = outcome
+            completion.error = error
+            completion.metadata = {**metadata, "helper_provenance": provenance}
+            # Full I/O remains durable, but embedding another copy of every
+            # child history/REPL local here would make the event log enormous.
+            event_completion = completion.to_dict()
+            event_completion["metadata"] = {
+                key: value for key, value in completion.metadata.items() if key != "iterations"
+            }
+            self.write_helper_event(
+                {
+                    **event,
+                    "event": "completed",
+                    "outcome": outcome,
+                    "elapsed_seconds": elapsed,
+                    "completion": event_completion,
+                    "embedded_trajectory_omitted": "iterations" in completion.metadata,
+                }
+            )
+            return completion
+
+        def recursive_call(index):
+            previous = getattr(_HELPER_PARENT, "call_id", None)
+            _HELPER_PARENT.call_id = starts[index][0]["call_id"]
+            try:
+                try:
+                    completion = self.subcall_fn(prompts[index], model)
+                    outcome, error = completion.response, completion.error
+                except Exception as exc:
+                    completion, error = None, str(exc)
+                    outcome = f"Error: RLM query failed - {exc}"
+                return finish(index, outcome, error, completion)
+            finally:
+                _HELPER_PARENT.call_id = previous
+
+        if recursive:
+            if len(prompts) == 1:
+                completions = [recursive_call(0)]
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=min(self.max_concurrent_subcalls, len(prompts))
+                ) as executor:
+                    completions = list(executor.map(recursive_call, range(len(prompts))))
+        else:
+            try:
+                if not self.lm_handler_address:
+                    outcomes = [
+                        ("Error: No LM handler configured", "No LM handler configured", None)
+                    ] * len(prompts)
+                else:
+                    if batched:
+                        responses = send_lm_request_batched(
+                            self.lm_handler_address,
+                            prompts,
+                            model=model,
+                            depth=self.depth,
+                            timeout=int(DEFAULT_WAVE_TIMEOUT + WAVE_TIMEOUT_SLACK),
+                        )
+                    else:
+                        request = LMRequest(prompt=prompts[0], model=model, depth=self.depth)
+                        timeout = (
+                            int(DEFAULT_WAVE_TIMEOUT + WAVE_TIMEOUT_SLACK)
+                            if self.record_failed_calls
+                            else 300
+                        )
+                        responses = [
+                            send_lm_request(self.lm_handler_address, request, timeout=timeout)
+                        ]
+                    if len(responses) != len(prompts):
+                        raise ValueError("helper response count differs from request count")
+                    outcomes = [
+                        (
+                            response.chat_completion.response
+                            if response.success
+                            else f"Error: {response.error}",
+                            response.error,
+                            response.chat_completion,
+                        )
+                        for response in responses
+                    ]
+            except Exception as exc:
+                outcomes = [(f"Error: LM query failed - {exc}", str(exc), None)] * len(prompts)
+            completions = [finish(i, *outcome) for i, outcome in enumerate(outcomes)]
+        self._pending_llm_calls.extend(
+            completion
+            for completion in completions
+            if completion.error is None or self.record_failed_calls
+        )
+        return [completion.response for completion in completions]
 
     def load_context(self, context_payload: dict | list | str):
         """Load context into the environment as context_0 (and 'context' alias)."""
@@ -641,8 +813,10 @@ class LocalREPL(NonIsolatedEnv):
         masquerading as sub-LLM response misrouting), one side's output was
         silently lost, and the unordered restores could leave a dead StringIO
         installed as the process's stdout. Fix: install a process-wide
-        thread-routing proxy ONCE; each cell registers its buffers for its
-        own exec thread only. Threads the model spawns inside a cell are not
+        thread-routing proxy ONCE; each cell pushes its buffers onto its
+        own exec thread's stack and pops them on exit. Same-thread recursive
+        children therefore restore their parent's capture, including on errors.
+        Threads the model spawns inside a cell are not
         registered and fall through to the real stream — never to another
         rollout's buffer.
         """

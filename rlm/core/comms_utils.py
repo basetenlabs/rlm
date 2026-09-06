@@ -95,7 +95,9 @@ class LMResponse:
         if self.error is not None:
             return {
                 "error": self.error,
-                "chat_completion": None,
+                "chat_completion": (
+                    self.chat_completion.to_dict() if self.chat_completion is not None else None
+                ),
                 "chat_completions": None,
             }
         if self.chat_completions is not None:
@@ -269,7 +271,7 @@ def send_lm_request_batched(
         # Convert batched response to list of individual responses. A completion
         # carrying an error means only that prompt failed; the rest still succeed.
         return [
-            LMResponse.error_response(chat_completion.error)
+            LMResponse(error=chat_completion.error, chat_completion=chat_completion)
             if chat_completion.error
             else LMResponse.success_response(chat_completion)
             for chat_completion in response.chat_completions

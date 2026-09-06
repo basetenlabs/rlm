@@ -312,6 +312,26 @@ class TestDepth1LimitChecks:
         assert exc_info.value.tokens_used == 160
         assert exc_info.value.token_limit == 100
 
+    def test_completion_limit_error_carries_consumed_usage(self):
+        """A terminal limit must not erase tokens already consumed."""
+        with patch.object(rlm_module, "get_client") as mock_get_client:
+            mock_lm = create_mock_lm(["No final answer yet."])
+            mock_get_client.return_value = mock_lm
+            rlm = RLM(
+                backend="openai",
+                backend_kwargs={"model_name": "test-model"},
+                max_depth=1,
+                max_tokens=1,
+            )
+
+            with pytest.raises(TokenLimitExceededError) as exc_info:
+                rlm.completion("Use some tokens")
+
+        usage = exc_info.value.usage_summary
+        assert usage.total_input_tokens == 100
+        assert usage.total_output_tokens == 50
+        assert usage.model_usage_summaries["mock-model"].total_calls == 1
+
 
 class TestDepth1LoggerMetadata:
     """Verify depth=1 logger metadata is captured correctly."""

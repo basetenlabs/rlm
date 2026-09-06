@@ -5,9 +5,10 @@ Uses a multi-threaded socket server. Protocol: 4-byte length prefix + JSON paylo
 """
 
 import asyncio
+import inspect
 import time
 from socketserver import StreamRequestHandler, ThreadingTCPServer
-from threading import Thread
+from threading import Event, Thread
 
 from rlm.clients.base_lm import BaseLM
 from rlm.core.comms_utils import (
@@ -75,6 +76,13 @@ class LMRequestHandler(StreamRequestHandler):
         REPL cell-timeout with no mention of the sub-call at all (found
         2026-08-05; the batched path always had per-prompt error strings).
         """
+        if handler.fixed_model_routing:
+            batch = self._handle_batched(
+                LMRequest(prompts=[request.prompt], model=request.model, depth=request.depth),
+                handler,
+            )
+            completion = batch.chat_completions[0]
+            return LMResponse(error=completion.error, chat_completion=completion)
         client = handler.get_client(request.model, request.depth)
 
         from rlm.utils.global_gate import get_gate
@@ -92,7 +100,9 @@ class LMRequestHandler(StreamRequestHandler):
         end_time = time.perf_counter()
 
         model_usage = client.get_last_usage()
-        root_model = request.model or client.model_name
+        root_model = (
+            client.model_name if handler.fixed_model_routing else request.model or client.model_name
+        )
         usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
         return LMResponse.success_response(
             chat_completion=RLMChatCompletion(
@@ -107,19 +117,25 @@ class LMRequestHandler(StreamRequestHandler):
     def _handle_batched(self, request: LMRequest, handler: "LMHandler") -> LMResponse:
         """Handle a batched prompts request using async for concurrency."""
         client = handler.get_client(request.model, request.depth)
-        root_model = request.model or client.model_name
+        root_model = (
+            client.model_name if handler.fixed_model_routing else request.model or client.model_name
+        )
 
-        def _cum() -> tuple[int, int]:
+        def _cum() -> tuple[int, int, int]:
             # Cumulative (running) usage for this model. Used to attribute the EXACT
             # batch total below — get_last_usage() is only the LAST call, so sharing
             # it across all N completions made the per-call trajectory N-count.
             try:
                 ms = client.get_usage_summary().model_usage_summaries.get(root_model)
-                return (int(ms.total_input_tokens), int(ms.total_output_tokens)) if ms else (0, 0)
+                return (
+                    int(ms.total_input_tokens), int(ms.total_output_tokens), int(ms.total_calls)
+                ) if ms else (0, 0, 0)
             except Exception:
-                return (0, 0)
+                if handler.fixed_model_routing:
+                    raise
+                return (0, 0, 0)
 
-        pre_in, pre_out = _cum()
+        pre_in, pre_out, pre_calls = _cum()
         start_time = time.perf_counter()
 
         sem = asyncio.Semaphore(handler.batch_max_concurrent)
@@ -131,6 +147,9 @@ class LMRequestHandler(StreamRequestHandler):
             async with sem:
                 if gate is None:
                     return await client.acompletion(prompt)
+                if handler.fixed_model_routing:
+                    async with gate.async_slot():
+                        return await client.acompletion(prompt)
                 # Deployment-wide slot held for the call's full duration (SDK
                 # retries included). Acquisition is a blocking flock spin, so
                 # it runs in a thread; its jittered sleep doubles as launch
@@ -142,38 +161,61 @@ class LMRequestHandler(StreamRequestHandler):
                 finally:
                     slot.__exit__(None, None, None)
 
+        pending = object()
+        settled = [pending] * len(request.prompts)
+        durations = [0.0] * len(request.prompts)
+
+        async def run_recorded(index: int, prompt: str):
+            started = time.perf_counter()
+            try:
+                value = await run_one(prompt)
+                settled[index] = value
+                return value
+            except BaseException as error:
+                settled[index] = error
+                raise
+            finally:
+                durations[index] = time.perf_counter() - started
+
         async def run_all():
-            tasks = [run_one(prompt) for prompt in request.prompts]
+            tasks = [run_recorded(index, prompt) for index, prompt in enumerate(request.prompts)]
             # return_exceptions=True so one failed call doesn't abort the whole
             # batch; failures are surfaced per-prompt as error completions below.
             return await asyncio.gather(*tasks, return_exceptions=True)
 
         # Hard wave deadline: a severed provider connection can otherwise park
         # the gather forever (all awaits suspended, nothing on the wire). On
-        # timeout every prompt gets an error completion, which the REPL surfaces
-        # to the root as retryable "Error: ..." strings.
+        # timeout strict mode retains settled results and cancels unfinished
+        # requests; legacy mode keeps its historical whole-wave error response.
         try:
-            results = asyncio.run(
-                asyncio.wait_for(run_all(), timeout=DEFAULT_WAVE_TIMEOUT)
+            results = handler.run_async(
+                asyncio.wait_for(run_all(), timeout=DEFAULT_WAVE_TIMEOUT),
+                timeout=DEFAULT_WAVE_TIMEOUT + 5,
             )
         except (asyncio.TimeoutError, TimeoutError):
             err = TimeoutError(
                 f"batched wave exceeded RLM_WAVE_TIMEOUT={DEFAULT_WAVE_TIMEOUT:.0f}s "
                 "(wedged provider connections?)"
             )
-            results = [err] * len(request.prompts)
+            results = (
+                [err if value is pending or isinstance(value, asyncio.CancelledError) else value
+                 for value in settled]
+                if handler.fixed_model_routing else [err] * len(request.prompts)
+            )
         end_time = time.perf_counter()
         total_time = end_time - start_time
 
-        post_in, post_out = _cum()
+        post_in, post_out, post_calls = _cum()
         n_ok = sum(1 for c in results if not isinstance(c, BaseException))
         # Attribute the batch's TRUE total usage (the cumulative delta = sum of every
         # call in this batch) to the FIRST successful completion, zero to the rest, so
         # the trajectory's per-call rlm_calls sum to the exact batch total. The client's
         # accumulation stays authoritative; this only fixes how usage is logged per-entry.
+        # If a strict wave has no successes, retain any observed usage on its
+        # first failed completion rather than silently dropping it.
         batch_usage = UsageSummary(model_usage_summaries={
             root_model: ModelUsageSummary(
-                total_calls=n_ok,
+                total_calls=post_calls - pre_calls if handler.fixed_model_routing else n_ok,
                 total_input_tokens=post_in - pre_in,
                 total_output_tokens=post_out - pre_out,
             )
@@ -182,18 +224,31 @@ class LMRequestHandler(StreamRequestHandler):
 
         chat_completions = []
         first_ok = True
-        for prompt, content in zip(request.prompts, results, strict=True):
+        for index, (prompt, content) in enumerate(zip(request.prompts, results, strict=True)):
             if isinstance(content, BaseException):
                 # Per-prompt failure: this slot returns an error; other prompts
                 # still succeed. The error message is carried back to the caller.
+                retain_usage = handler.fixed_model_routing and n_ok == 0 and index == 0
+                failure_metadata = None
+                if handler.fixed_model_routing:
+                    failure_metadata = {
+                        "usage_status": (
+                            "observed_partial"
+                            if retain_usage and (post_in > pre_in or post_out > pre_out or post_calls > pre_calls)
+                            else "unknown"
+                        ),
+                        "observed_usage_scope": "batch_aggregate",
+                        "exception_type": type(content).__name__,
+                    }
                 chat_completions.append(
                     RLMChatCompletion(
                         root_model=root_model,
                         prompt=prompt,
                         response="",
-                        usage_summary=empty_usage,
-                        execution_time=0.0,
+                        usage_summary=batch_usage if retain_usage else empty_usage,
+                        execution_time=durations[index] if handler.fixed_model_routing else 0.0,
                         error=f"llm() call failed - {content}",
+                        metadata=failure_metadata,
                     )
                 )
             else:
@@ -203,7 +258,10 @@ class LMRequestHandler(StreamRequestHandler):
                         prompt=prompt,
                         response=content,
                         usage_summary=batch_usage if first_ok else empty_usage,
-                        execution_time=total_time / len(request.prompts),
+                        execution_time=(
+                            durations[index] if handler.fixed_model_routing
+                            else total_time / len(request.prompts)
+                        ),
                     )
                 )
                 first_ok = False
@@ -233,13 +291,26 @@ class LMHandler:
         port: int = 0,  # auto-assign available port
         other_backend_client: BaseLM | None = None,
         batch_max_concurrent: int = 16,
+        fixed_model_routing: bool = False,
     ):
+        if fixed_model_routing and other_backend_client is None:
+            raise ValueError("fixed_model_routing requires an explicit leaf backend")
         self.default_client = client
         self.other_backend_client = other_backend_client
+        self.fixed_model_routing = fixed_model_routing
         self.clients: dict[str, BaseLM] = {}
         self.host = host
         self._server: ThreadingLMServer | None = None
         self._thread: Thread | None = None
+        # Async clients (notably httpx/OpenAI) bind connection pools to the
+        # event loop that first uses them. Creating a fresh loop with
+        # asyncio.run() for every batch caused pooled connections from the
+        # previous loop to be abandoned, producing large waves of HTTP 499s
+        # that the SDK then retried transparently. One handler-owned loop keeps
+        # the client and every batch on the same lifecycle.
+        self._async_loop: asyncio.AbstractEventLoop | None = None
+        self._async_thread: Thread | None = None
+        self._async_ready = Event()
         self._port = port
         self.batch_max_concurrent = batch_max_concurrent
 
@@ -256,7 +327,19 @@ class LMHandler:
         - depth=0: use default_client (main backend)
         - depth=1: use other_backend_client if it exists, otherwise default_client
         - If model is specified and exists in clients, use that (overrides depth routing)
+        - In fixed mode, depth 0 uses the root client and every environment depth
+          uses the leaf client; conflicting model overrides are rejected.
         """
+        if self.fixed_model_routing:
+            client = self.default_client if depth == 0 else self.other_backend_client
+            assert client is not None  # Fixed-mode constructor requires a leaf client.
+            role = "root/recursive completion" if depth == 0 else "flat llm_query/llm_query_batched"
+            if model is not None and model != client.model_name:
+                raise ValueError(
+                    f"fixed_model_routing: {role} permits only model {client.model_name!r}; "
+                    f"received {model!r}"
+                )
+            return client
         if model and model in self.clients:
             return self.clients[model]
 
@@ -283,6 +366,13 @@ class LMHandler:
         if self._server is not None:
             return self.address
 
+        self._async_loop = asyncio.new_event_loop()
+        self._async_ready.clear()
+        self._async_thread = Thread(target=self._serve_async_loop, daemon=True)
+        self._async_thread.start()
+        if not self._async_ready.wait(timeout=5):
+            raise RuntimeError("LMHandler async event loop failed to start")
+
         self._server = ThreadingLMServer((self.host, self._port), LMRequestHandler)
         self._server.lm_handler = self  # type: ignore
 
@@ -291,12 +381,68 @@ class LMHandler:
 
         return self.address
 
+    def _serve_async_loop(self) -> None:
+        assert self._async_loop is not None
+        asyncio.set_event_loop(self._async_loop)
+        self._async_ready.set()
+        self._async_loop.run_forever()
+        pending = asyncio.all_tasks(self._async_loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            self._async_loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        self._async_loop.run_until_complete(self._async_loop.shutdown_asyncgens())
+        self._async_loop.close()
+
+    def run_async(self, coroutine, *, timeout: float):
+        """Run a coroutine on the handler's single long-lived event loop."""
+        if self._async_loop is None or not self._async_loop.is_running():
+            if inspect.iscoroutine(coroutine):
+                coroutine.close()
+            raise RuntimeError("LMHandler async event loop is not running")
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._async_loop)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            future.cancel()
+            raise
+
+    async def _close_async_clients(self) -> None:
+        seen: set[int] = set()
+        for client in (
+            self.default_client,
+            self.other_backend_client,
+            *self.clients.values(),
+        ):
+            if client is None or id(client) in seen:
+                continue
+            seen.add(id(client))
+            async_client = getattr(client, "async_client", None)
+            close = getattr(async_client, "close", None)
+            if close is None:
+                continue
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
     def stop(self):
         """Stop the socket server."""
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
             self._thread = None
+        if self._async_loop is not None and self._async_loop.is_running():
+            try:
+                self.run_async(self._close_async_clients(), timeout=10)
+            finally:
+                self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+        if self._async_thread is not None:
+            self._async_thread.join(timeout=10)
+            self._async_thread = None
+        self._async_loop = None
 
     def completion(self, prompt: str, model: str | None = None) -> str:
         """Direct completion call (for main process use)."""
