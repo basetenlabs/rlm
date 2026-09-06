@@ -3,6 +3,7 @@ import os
 import socket
 import sys
 from collections import defaultdict
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -78,13 +79,23 @@ def _maybe_dump_reasoning(response: Any, model: str) -> None:
         pass  # never let debug capture break a rollout
 
 
-def _normalize_sampling_args(sampling_args: dict[str, Any], keep_max_tokens: bool = False) -> dict[str, Any]:
+def _normalize_sampling_args(
+    sampling_args: dict[str, Any],
+    keep_max_tokens: bool = False,
+    response_format: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Match the rename done by verifiers' OpenAIChatCompletionsClient so the
     same sampling_args dict produces byte-equivalent chat.completions.create
     calls in both harnesses. Pops ``extra_body`` so the caller can merge it
     with its own ``extra_body`` rather than passing it twice (TypeError).
     """
     args = dict(sampling_args or {})
+    if response_format is not None:
+        if not isinstance(response_format, dict):
+            raise TypeError("response_format must be a dict or None")
+        args["response_format"] = response_format
+    if "response_format" in args:
+        args["response_format"] = deepcopy(args["response_format"])
     if "max_tokens" in args and not keep_max_tokens:
         args["max_completion_tokens"] = args.pop("max_tokens")
     args.pop("extra_body", None)
@@ -230,7 +241,13 @@ class OpenAIClient(BaseLM):
         # REASONING_CAPTURE_CAP; captured per-turn into the trajectory. None until first call.
         self.last_reasoning_content: str | None = None
 
-    def completion(self, prompt: str | list[dict[str, Any]], model: str | None = None) -> str:
+    def completion(
+        self,
+        prompt: str | list[dict[str, Any]],
+        model: str | None = None,
+        *,
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
         elif isinstance(prompt, list) and all(isinstance(item, dict) for item in prompt):
@@ -253,6 +270,7 @@ class OpenAIClient(BaseLM):
             extra_body=extra_body,
             **_normalize_sampling_args(
                 self.sampling_args,
+                response_format=response_format,
                 keep_max_tokens="thinkingmachines" in str(self.base_url or "")),
         )
         self._track_cost(response, model)
@@ -262,7 +280,11 @@ class OpenAIClient(BaseLM):
         return _strip_inline_thinking(response.choices[0].message.content)
 
     async def acompletion(
-        self, prompt: str | list[dict[str, Any]], model: str | None = None
+        self,
+        prompt: str | list[dict[str, Any]],
+        model: str | None = None,
+        *,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
@@ -286,6 +308,7 @@ class OpenAIClient(BaseLM):
             extra_body=extra_body,
             **_normalize_sampling_args(
                 self.sampling_args,
+                response_format=response_format,
                 keep_max_tokens="thinkingmachines" in str(self.base_url or "")),
         )
         self._track_cost(response, model)

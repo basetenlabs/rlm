@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import struct
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +41,13 @@ class LMRequest:
     prompts: list[str | dict[str, Any]] | None = None
     model: str | None = None
     depth: int = 0
+    response_format: dict[str, Any] | None = None
+
+    def __post_init__(self):
+        if self.response_format is not None:
+            if not isinstance(self.response_format, dict):
+                raise TypeError("response_format must be a dict or None")
+            self.response_format = deepcopy(self.response_format)
 
     @property
     def is_batched(self) -> bool:
@@ -56,6 +64,8 @@ class LMRequest:
         if self.model is not None:
             d["model"] = self.model
         d["depth"] = self.depth
+        if self.response_format is not None:
+            d["response_format"] = deepcopy(self.response_format)
         return d
 
     @classmethod
@@ -66,6 +76,7 @@ class LMRequest:
             prompts=data.get("prompts"),
             model=data.get("model"),
             depth=data.get("depth", -1),  # TODO: Default should throw an error
+            response_format=data.get("response_format"),
         )
 
 
@@ -241,6 +252,8 @@ def send_lm_request_batched(
     model: str | None = None,
     timeout: int = 300,
     depth: int = 0,
+    *,
+    response_format: dict[str, Any] | None = None,
 ) -> list[LMResponse]:
     """Send a batched LM request and return a list of typed responses.
 
@@ -250,12 +263,13 @@ def send_lm_request_batched(
         model: Optional model name to use.
         timeout: Socket timeout in seconds.
         depth: Depth for routing (default 0).
+        response_format: Optional request-local provider format, shared by value across the batch.
 
     Returns:
         List of LMResponse objects, one per prompt, in the same order.
     """
     try:
-        request = LMRequest(prompts=prompts, model=model, depth=depth)
+        request = LMRequest(prompts=prompts, model=model, depth=depth, response_format=response_format)
         response_data = socket_request(address, request.to_dict(), timeout)
         response = LMResponse.from_dict(response_data)
 

@@ -7,6 +7,7 @@ Uses a multi-threaded socket server. Protocol: 4-byte length prefix + JSON paylo
 import asyncio
 import inspect
 import time
+from copy import deepcopy
 from socketserver import StreamRequestHandler, ThreadingTCPServer
 from threading import Event, Thread
 
@@ -83,11 +84,16 @@ class LMRequestHandler(StreamRequestHandler):
         gate = get_gate()
         start_time = time.perf_counter()
         try:
+            kwargs = (
+                {"response_format": deepcopy(request.response_format)}
+                if request.response_format is not None
+                else {}
+            )
             if gate is not None:
                 with gate.slot():  # deployment-wide cap, retries held inside
-                    content = client.completion(request.prompt)
+                    content = client.completion(request.prompt, **kwargs)
             else:
-                content = client.completion(request.prompt)
+                content = client.completion(request.prompt, **kwargs)
         except Exception as e:  # noqa: BLE001 — reason must reach the model in-band
             return LMResponse.error_response(f"llm() call failed - {e}")
         end_time = time.perf_counter()
@@ -130,8 +136,13 @@ class LMRequestHandler(StreamRequestHandler):
 
         async def run_one(prompt: str):
             async with sem:
+                kwargs = (
+                    {"response_format": deepcopy(request.response_format)}
+                    if request.response_format is not None
+                    else {}
+                )
                 if gate is None:
-                    return await client.acompletion(prompt)
+                    return await client.acompletion(prompt, **kwargs)
                 # Deployment-wide slot held for the call's full duration (SDK
                 # retries included). Acquisition is a blocking flock spin, so
                 # it runs in a thread; its jittered sleep doubles as launch
@@ -139,7 +150,7 @@ class LMRequestHandler(StreamRequestHandler):
                 slot = gate.slot()
                 await asyncio.to_thread(slot.__enter__)
                 try:
-                    return await client.acompletion(prompt)
+                    return await client.acompletion(prompt, **kwargs)
                 finally:
                     slot.__exit__(None, None, None)
 
